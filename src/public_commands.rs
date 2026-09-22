@@ -11,6 +11,10 @@ pub(crate) fn commands() -> Vec<CreateCommand> {
         CreateCommand::new("storage")
             .description("Show this server's used and available storage")
             .dm_permission(false),
+        CreateCommand::new("disable")
+            .description("Disable Clause for this server until /setup is run again")
+            .default_member_permissions(Permissions::MANAGE_GUILD)
+            .dm_permission(false),
         CreateCommand::new("settings")
             .description("Show this server's logging, retention, and privacy settings")
             .dm_permission(false),
@@ -348,6 +352,34 @@ fn ai_error_detail(error: &crate::ai::SummaryError) -> String {
     }
 }
 
+fn disable_guild_settings(db: &rusqlite::Connection, guild: i64) -> rusqlite::Result<()> {
+    db.execute_batch("SAVEPOINT disable_guild")?;
+    let result = (|| -> rusqlite::Result<()> {
+        db.execute(
+            "INSERT INTO guild_configs (guild_id, setup_completed, log_channel_id, log_level, retention)
+            VALUES (?1, 0, NULL, 'off', 'none')
+            ON CONFLICT(guild_id) DO UPDATE SET
+            setup_completed = 0, log_channel_id = NULL, log_level = 'off', retention = 'none'",
+            [guild],
+        )?;
+        db.execute(
+            "DELETE FROM guild_manager_roles WHERE guild_id = ?1",
+            [guild],
+        )?;
+        db.execute(
+            "DELETE FROM guild_bot_channels WHERE guild_id = ?1",
+            [guild],
+        )?;
+        delete_ai_config(db, guild)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        db.execute_batch("ROLLBACK TO disable_guild")?;
+    }
+    db.execute_batch("RELEASE disable_guild")?;
+    result
+}
+
 enum RulesAction {
     List,
     Export,
@@ -492,6 +524,91 @@ impl Handler {
         get_ai_config(&db, guild.get() as i64).ok().flatten()
     }
 
+    async fn disable_command(&self, ctx: &Context, command: &CommandInteraction) {
+        let Some(guild) = command.guild_id.filter(|_| command.member.is_some()) else {
+            let _ = command
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .ephemeral(true)
+                            .content("Use /disable inside your server."),
+                    ),
+                )
+                .await;
+            return;
+        };
+        if command.defer_ephemeral(&ctx.http).await.is_err() {
+            return;
+        }
+        let allowed = command
+            .member
+            .as_deref()
+            .and_then(|member| member.permissions)
+            .is_some_and(|permissions| permissions.administrator() || permissions.manage_guild());
+        if !allowed {
+            let _ = command
+                .edit_response(
+                    &ctx.http,
+                    EditInteractionResponse::new()
+                        .content("You need Administrator or Manage Server to disable Clause."),
+                )
+                .await;
+            return;
+        }
+
+        let database = self.database.clone();
+        let root = self.storage_root.clone();
+        let lock = self.storage_lock.clone();
+        let disabled =
+            tokio::task::spawn_blocking(move || -> Result<retention::ClearReport, String> {
+                let db = database
+                    .lock()
+                    .map_err(|_| "Settings are unavailable.".to_owned())?;
+                disable_guild_settings(&db, guild.get() as i64)
+                    .map_err(|_| "Could not disable Clause for this server.".to_owned())?;
+                let _guard = lock
+                    .lock()
+                    .map_err(|_| "Storage is unavailable.".to_owned())?;
+                retention::clear(&root, guild.get())
+                    .or_else(|_| Ok(retention::ClearReport { files: 0, bytes: 0 }))
+            })
+            .await;
+
+        let (message, level) = match disabled {
+            Ok(Ok(report)) => (
+                format!(
+                    "Clause is disabled for this server. Run /setup to enable it again. Cleared {} retained local log file(s), freeing {} bytes. Uploaded files and curated rules were kept.",
+                    report.files, report.bytes
+                ),
+                Level::Warn,
+            ),
+            Ok(Err(error)) => (error, Level::Error),
+            Err(_) => (
+                "Could not disable Clause for this server.".to_owned(),
+                Level::Error,
+            ),
+        };
+        let sent = command
+            .edit_response(
+                &ctx.http,
+                EditInteractionResponse::new().content(message.clone()),
+            )
+            .await
+            .is_ok();
+        self.logger.log(
+            ctx,
+            guild,
+            if sent { level } else { Level::Error },
+            format!(
+                "/disable for user {}: {}; response {}",
+                command.user.id,
+                message,
+                if sent { "sent" } else { "failed" }
+            ),
+        );
+    }
+
     async fn ai_command(&self, ctx: &Context, command: &CommandInteraction) {
         let Some(guild) = command.guild_id.filter(|_| command.member.is_some()) else {
             let _ = command
@@ -619,6 +736,10 @@ impl Handler {
     pub(crate) async fn public_command(&self, ctx: &Context, command: &CommandInteraction) {
         if command.data.name == "storage" {
             self.storage_command(ctx, command).await;
+            return;
+        }
+        if command.data.name == "disable" {
+            self.disable_command(ctx, command).await;
             return;
         }
         if command.data.name == "settings" {
@@ -1662,7 +1783,11 @@ mod tests {
     fn public_commands_do_not_require_discord_permissions_or_filename_arguments() {
         for command in commands() {
             let value = serde_json::to_value(command).unwrap();
-            assert!(value["default_member_permissions"].is_null());
+            if value["name"] == "disable" {
+                assert_eq!(value["default_member_permissions"], "32");
+            } else {
+                assert!(value["default_member_permissions"].is_null());
+            }
             let has_filename = value["options"]
                 .as_array()
                 .into_iter()
@@ -1671,6 +1796,21 @@ mod tests {
                 .any(|option| option["name"] == "filename");
             assert!(!has_filename);
         }
+    }
+
+    #[test]
+    fn disable_command_is_registered_for_manage_server() {
+        let command = commands()
+            .into_iter()
+            .find(|command| serde_json::to_value(command).unwrap()["name"] == "disable")
+            .unwrap();
+        let value = serde_json::to_value(command).unwrap();
+        assert_eq!(
+            value["description"],
+            "Disable Clause for this server until /setup is run again"
+        );
+        assert_eq!(value["default_member_permissions"], "32");
+        assert_eq!(value["dm_permission"], false);
     }
 
     #[test]
@@ -1737,6 +1877,45 @@ mod tests {
                 .iter()
                 .any(|option| { option["name"] == "api_key" && option["required"] == true })
         );
+    }
+
+    #[test]
+    fn disable_guild_settings_clears_setup_and_private_provider() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE guild_configs (
+                guild_id INTEGER PRIMARY KEY,
+                setup_completed INTEGER NOT NULL DEFAULT 0,
+                log_channel_id INTEGER,
+                log_level TEXT NOT NULL DEFAULT 'info',
+                retention TEXT NOT NULL DEFAULT 'none');
+            CREATE TABLE guild_manager_roles (
+                guild_id INTEGER NOT NULL, role_id INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, role_id));
+            CREATE TABLE guild_bot_channels (
+                guild_id INTEGER NOT NULL, channel_id INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, channel_id));
+            CREATE TABLE guild_ai_configs (
+                guild_id INTEGER PRIMARY KEY,
+                endpoint TEXT NOT NULL,
+                api_key TEXT NOT NULL,
+                model TEXT NOT NULL);
+            INSERT INTO guild_configs VALUES (1, 1, 10, 'debug', 'all:7');
+            INSERT INTO guild_manager_roles VALUES (1, 20);
+            INSERT INTO guild_bot_channels VALUES (1, 30);
+            INSERT INTO guild_ai_configs VALUES (1, 'https://example.test/v1/chat/completions', 'secret', 'model');",
+        )
+        .unwrap();
+
+        disable_guild_settings(&db, 1).unwrap();
+        let config = get_guild_config(&db, 1).unwrap().unwrap();
+        assert!(!config.setup_completed);
+        assert_eq!(config.log_channel_id, None);
+        assert_eq!(config.log_level, Level::Off);
+        assert_eq!(config.retention, retention::Policy::None);
+        assert!(config.channel_ids.is_empty());
+        assert!(config.admin_role_ids.is_empty());
+        assert!(get_ai_config(&db, 1).unwrap().is_none());
     }
 
     #[test]

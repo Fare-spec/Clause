@@ -71,7 +71,8 @@ Saving a None retention policy removes existing bot-owned local logs. Changing
 the scope or shortening retention can also remove records. Expiry does not delete
 uploaded files or log messages already posted to Discord. Configured bot managers
 can use `/logs clear confirm:true` to delete Clause-owned local retained logs
-early and free guild storage. `/files remove` permanently deletes the named
+early and free guild storage. Server administrators can use `/disable` to stop
+Clause for the guild until setup is run again. `/files remove` permanently deletes the named
 upload. The [Privacy Policy](PRIVACY.md) describes retention periods, cleanup
 limitations, access and data requests.
 

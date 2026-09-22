@@ -74,7 +74,7 @@ startup, approximately every minute while the bot is running, before file/storag
 operations, and when setup is saved. Offline periods or storage errors can delay
 physical deletion until cleanup succeeds. Shorter policies apply to existing
 records. Configured bot managers can also run `/logs clear confirm:true` to delete
-Clause-owned local retained logs early and free guild storage. Uploads have no
+Clause-owned local retained logs early and free guild storage. Server administrators can run `/disable` to mark setup incomplete and clear retained local logs for that guild. Uploads have no
 automatic expiry; authorized managers can remove them, and the operator handles
 applicable personal-data requests. Configuration and folders are not automatically
 erased when the bot leaves a server; the operator must remove data when it is no

@@ -370,6 +370,7 @@ impl EventHandler for Handler {
                 if matches!(
                     command.data.name.as_str(),
                     "storage"
+                        | "disable"
                         | "settings"
                         | "summary"
                         | "rules"

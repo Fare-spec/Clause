@@ -49,6 +49,11 @@ The container runs as a non-root user and requires no inbound ports. Stop it wit
 `docker stop clause` or `docker compose stop`; the bot handles SIGTERM and Ctrl+C
 for graceful shutdown.
 
+Only run one live Clause process with the same Discord bot token. Running two
+active deployments with the same token can cause duplicate gateway sessions,
+confusing command behavior, and race conditions against the same Discord bot
+identity.
+
 Slash commands are registered globally by default when the bot becomes ready.
 For development or a single test server, set `COMMAND_GUILD_ID=<guild-id>` before
 startup to register the current command set directly in that guild. Guild command
@@ -119,7 +124,9 @@ also be one of the bot channels.
 Settings are saved together in SQLite (`DATABASE_PATH`, default `bot.db`) and
 survive restarts. Cancel leaves previously saved settings intact.
 
-Run `/setup` again to edit existing settings. Only one administrator can configure
+Run `/disable` as an administrator or member with Manage Server to disable Clause for the server. It marks setup incomplete, clears selected manager roles/channels, removes the server AI override, clears retained local logs, and keeps uploads/rules on disk for later cleanup or reuse. Run `/setup` again to enable the bot.
+
+Run `/setup` again to edit existing settings.Run `/setup` again to edit existing settings. Only one administrator can configure
 a server at a time; reopening your own setup replaces your previous panel. Panels
 expire after 15 minutes or a bot restart. Only administrators and members with
 Manage Server can change setup, including the manager roles.
@@ -275,6 +282,7 @@ channel imports, and message review in that server.
 
 ## Storage status and privacy information
 
+- `/disable`: administrator/Manage Server command that disables Clause for the server until `/setup` is run again. It clears configured roles/channels, the server AI override, and retained local logs, while leaving uploads and curated rules on disk.
 - `/storage`: private response with available/used bytes and an uploads, retained
   logs, and metadata/other breakdown after retention cleanup. Any server member
   can request the aggregate; no file names or log contents are exposed.
