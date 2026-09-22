@@ -133,8 +133,7 @@ folder name. Uploaded files are stored in `uploads/` and retained logs in `logs/
 Set `GUILD_STORAGE_PATH` to change the root directory. Existing
 files survive repeat setup and cancellation does not create a folder.
 
-Each folder contains `storage-limit.json` recording a **50 MB**
-limit per guild, including uploads, retained logs, and metadata. Registration and uploads check recursive file usage and refuse writes above
+Each folder contains `storage-limit.json` recording the configured guild quota, defaulting to **10 MB / 10 Mo**. The quota includes uploads, retained logs, and metadata. Set `GUILD_STORAGE_LIMIT_MB` or `GUILD_STORAGE_LIMIT_BYTES` before startup to change it. Registration and uploads check recursive file usage and refuse writes above
 the limit. Quota checks and file writes are serialized within the bot process.
 This is an application limit, not an OS filesystem quota; run only one bot
 process against a storage directory. Setup does not
@@ -160,8 +159,8 @@ Manage Server can use these commands in a configured bot channel:
 - `/files remove filename`: permanently delete the named file.
 
 All responses are private. `storage-limit.json` is listed and readable but cannot
-be uploaded, replaced, or removed through these commands. The 50 Mo limit is
-fixed by the bot, not by user-supplied JSON. Uploads include metadata in total
+be uploaded, replaced, or removed through these commands. The configured quota is
+fixed by the bot operator, not by user-supplied JSON. Uploads include metadata in total
 usage and never overwrite existing files; remove a file first to replace it.
 Removing files is allowed even when the folder is over quota.
 
@@ -199,7 +198,7 @@ ownership before delivery and disables mentions in logs. Restrict the log
 channel to trusted members using Discord permissions: debug can copy content
 from other channels the bot can access. The bot does not change channel
 permissions automatically. Guild payloads are not written to console logs. Disk retention is configured
-separately; retained logs count toward the same 50 Mo quota as uploads.
+separately; retained logs count toward the same configured quota as uploads.
 
 Debug covers events available through the bot’s enabled gateway intents; it
 cannot see inaccessible channels or events Discord does not send. DMs, global

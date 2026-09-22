@@ -1,12 +1,44 @@
 //! Guild storage. Callers serialize operations with Handler::storage_lock.
 //! The application quota includes metadata and is not an OS disk quota.
 use std::{
-    fs,
+    env, fs,
     io::{self, Write},
     path::{Path, PathBuf},
 };
 
-pub(crate) const STORAGE_LIMIT_BYTES: u64 = 50_000_000;
+pub(crate) const DEFAULT_STORAGE_LIMIT_BYTES: u64 = 10_000_000;
+const MIN_STORAGE_LIMIT_BYTES: u64 = 1_000_000;
+const MAX_STORAGE_LIMIT_BYTES: u64 = 1_000_000_000;
+
+pub(crate) fn limit_bytes() -> u64 {
+    env::var("GUILD_STORAGE_LIMIT_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .or_else(|| {
+            env::var("GUILD_STORAGE_LIMIT_MB")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .and_then(|mb| mb.checked_mul(1_000_000))
+        })
+        .filter(|bytes| (MIN_STORAGE_LIMIT_BYTES..=MAX_STORAGE_LIMIT_BYTES).contains(bytes))
+        .unwrap_or(DEFAULT_STORAGE_LIMIT_BYTES)
+}
+
+pub(crate) fn limit_label() -> String {
+    let limit = limit_bytes();
+    if limit % 1_000_000 == 0 {
+        format!("{} Mo", limit / 1_000_000)
+    } else {
+        format!("{limit} bytes")
+    }
+}
+
+pub(crate) fn limit_metadata(guild_id: u64) -> String {
+    format!(
+        "{{\"guild_id\":\"{guild_id}\",\"limit_bytes\":{}}}\n",
+        limit_bytes()
+    )
+}
 
 pub(crate) fn register(root: &Path, guild_id: u64) -> io::Result<PathBuf> {
     let directory = root.join(guild_id.to_string());
@@ -24,24 +56,19 @@ pub(crate) fn register(root: &Path, guild_id: u64) -> io::Result<PathBuf> {
         Err(error) => return Err(error),
     }
     let metadata_path = directory.join("storage-limit.json");
-    let metadata =
-        format!("{{\"guild_id\":\"{guild_id}\",\"limit_bytes\":{STORAGE_LIMIT_BYTES}}}\n");
-    let used = usage(&directory)?;
+    let metadata = limit_metadata(guild_id);
     match fs::symlink_metadata(&metadata_path) {
-        Ok(_) => {
-            if fs::read_to_string(&metadata_path)? != metadata {
+        Ok(file_metadata) => {
+            if !file_metadata.is_file() || file_metadata.file_type().is_symlink() {
                 return Err(io::Error::other(
-                    "Guild storage metadata does not match its limit",
+                    "Guild storage metadata must be a regular file",
                 ));
             }
-            if used > STORAGE_LIMIT_BYTES {
-                return Err(io::Error::other("Guild storage exceeds 50 MB"));
+            if fs::read_to_string(&metadata_path)? != metadata {
+                fs::write(&metadata_path, metadata.as_bytes())?;
             }
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if used.saturating_add(metadata.len() as u64) > STORAGE_LIMIT_BYTES {
-                return Err(io::Error::other("Guild storage exceeds 50 MB"));
-            }
             let mut file = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -178,10 +205,13 @@ pub(crate) fn list(root: &Path, guild: u64) -> io::Result<(Vec<(String, u64)>, u
 pub(crate) fn upload(root: &Path, guild: u64, name: &str, data: &[u8]) -> io::Result<()> {
     validate_name(name, true)?;
     let directory = layout(root, guild)?;
-    if usage(&directory)?.saturating_add(data.len() as u64) > STORAGE_LIMIT_BYTES {
-        return Err(io::Error::other(
-            "This upload would exceed the guild's 50 Mo (50,000,000 byte) limit. Remove files first.",
-        ));
+    let limit = limit_bytes();
+    if usage(&directory)?.saturating_add(data.len() as u64) > limit {
+        return Err(io::Error::other(format!(
+            "This upload would exceed the guild's {} ({} byte) limit. Remove files first.",
+            limit_label(),
+            limit
+        )));
     }
     let path = directory.join("uploads").join(name);
     let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&path)
@@ -221,10 +251,13 @@ pub(crate) fn read(root: &Path, guild: u64, name: &str) -> io::Result<Vec<u8>> {
     let path = regular_file(root, guild, name, false)?;
     let mut data = Vec::new();
     fs::File::open(path)?
-        .take(STORAGE_LIMIT_BYTES + 1)
+        .take(limit_bytes() + 1)
         .read_to_end(&mut data)?;
-    if data.len() as u64 > STORAGE_LIMIT_BYTES {
-        return Err(io::Error::other("File exceeds the 50 Mo limit."));
+    if data.len() as u64 > limit_bytes() {
+        return Err(io::Error::other(format!(
+            "File exceeds the {} limit.",
+            limit_label()
+        )));
     }
     Ok(data)
 }
@@ -241,10 +274,13 @@ pub(crate) fn read_uploads(root: &Path, guild: u64) -> io::Result<Vec<(String, V
         }
         let mut data = Vec::new();
         fs::File::open(entry.path())?
-            .take(STORAGE_LIMIT_BYTES + 1)
+            .take(limit_bytes() + 1)
             .read_to_end(&mut data)?;
-        if data.len() as u64 > STORAGE_LIMIT_BYTES {
-            return Err(io::Error::other("File exceeds the 50 Mo limit."));
+        if data.len() as u64 > limit_bytes() {
+            return Err(io::Error::other(format!(
+                "File exceeds the {} limit.",
+                limit_label()
+            )));
         }
         files.push((entry.file_name().to_string_lossy().into_owned(), data));
     }
@@ -261,7 +297,7 @@ pub(crate) struct Usage {
 }
 impl Usage {
     pub(crate) fn available(&self) -> u64 {
-        STORAGE_LIMIT_BYTES.saturating_sub(self.total)
+        limit_bytes().saturating_sub(self.total)
     }
 }
 

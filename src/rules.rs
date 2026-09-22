@@ -166,7 +166,7 @@ fn save(root: &Path, guild: u64, book: &RuleBook) -> io::Result<()> {
     if used
         .saturating_sub(existing)
         .saturating_add(data.len() as u64)
-        > storage::STORAGE_LIMIT_BYTES
+        > storage::limit_bytes()
     {
         return Err(io::Error::other("Rules would exceed guild storage."));
     }

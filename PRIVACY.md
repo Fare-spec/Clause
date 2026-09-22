@@ -58,7 +58,7 @@ rule-source channels, or bot-channel messages.
 Server configuration is stored in SQLite, including role/channel IDs, log level,
 retention policy, and any server-specific AI provider override. Each server has a separate directory containing protected
 quota metadata, an `uploads/` folder, and a `logs/` folder. Uploads, local retained
-logs, and metadata share a 50 Mo (50,000,000 byte) limit. SQLite configuration and
+logs, and metadata share a configurable per-guild limit, defaulting to 10 Mo (10,000,000 bytes). SQLite configuration and
 Discord-hosted messages are outside this file quota.
 
 Disk retention defaults to **None**. Administrators can select:

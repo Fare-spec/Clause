@@ -166,8 +166,7 @@ pub(crate) fn retain(
     let data = serde_json::to_vec(
         &serde_json::json!({"guild_id":guild.to_string(), "recorded_at":timestamp, "kind":kind.key(), "text":text}),
     )?;
-    if storage::usage(&directory)?.saturating_add(data.len() as u64) > storage::STORAGE_LIMIT_BYTES
-    {
+    if storage::usage(&directory)?.saturating_add(data.len() as u64) > storage::limit_bytes() {
         return Err(io::Error::other(
             "Guild storage full; retained record skipped",
         ));

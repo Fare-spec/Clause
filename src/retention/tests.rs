@@ -121,7 +121,7 @@ fn logs_share_quota_with_uploads_and_are_not_accessible_as_upload_paths() {
     let used = storage::list(&f.0, 1).unwrap().1;
     assert!(used > storage::read(&f.0, 1, storage::LIMIT_FILE).unwrap().len() as u64);
     let file = fs::File::create(f.0.join("1/uploads/filler.bin")).unwrap();
-    file.set_len(storage::STORAGE_LIMIT_BYTES - used).unwrap();
+    file.set_len(storage::limit_bytes() - used).unwrap();
     assert!(retain(&f.0, 1, Policy::All(1), Kind::Message, 100, "full", 100).is_err());
     assert!(storage::upload(&f.0, 1, "extra.txt", b"x").is_err());
     assert_eq!(f.count(), 1);

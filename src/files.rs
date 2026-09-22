@@ -31,7 +31,10 @@ pub(crate) fn command() -> CreateCommand {
             CreateCommandOption::new(
                 CommandOptionType::SubCommand,
                 "upload",
-                "Upload a file (50 Mo total per server)",
+                &format!(
+                    "Upload a file ({} total per server)",
+                    storage::limit_label()
+                ),
             )
             .add_sub_option(
                 CreateCommandOption::new(CommandOptionType::Attachment, "file", "File to upload")
@@ -138,8 +141,10 @@ async fn parse_action(command: &CommandInteraction) -> Result<Action, FileFailur
                 })
                 .ok_or("Attach a file to upload.")?;
             storage::validate_name(&file.filename, true).map_err(|e| e.to_string())?;
-            if u64::from(file.size) > storage::STORAGE_LIMIT_BYTES {
-                return Err("File exceeds the 50 Mo storage limit.".into());
+            if u64::from(file.size) > storage::limit_bytes() {
+                return Err(
+                    format!("File exceeds the {} storage limit.", storage::limit_label()).into(),
+                );
             }
             let url = reqwest::Url::parse(&file.url).map_err(|_| "Invalid attachment URL.")?;
             if url.scheme() != "https"
@@ -169,8 +174,12 @@ async fn parse_action(command: &CommandInteraction) -> Result<Action, FileFailur
                 .await
                 .map_err(|_| FileFailure::error("Attachment download failed. Try again."))?
             {
-                if data.len() as u64 + chunk.len() as u64 > storage::STORAGE_LIMIT_BYTES {
-                    return Err("File exceeds the 50 Mo storage limit.".into());
+                if data.len() as u64 + chunk.len() as u64 > storage::limit_bytes() {
+                    return Err(format!(
+                        "File exceeds the {} storage limit.",
+                        storage::limit_label()
+                    )
+                    .into());
                 }
                 data.extend_from_slice(&chunk);
             }
@@ -326,7 +335,7 @@ impl Handler {
                         }).collect::<Vec<_>>().join("\n");
                         reply = reply.clone().embed(CreateEmbed::new().title("Guild uploads").colour(0x5865F2)
                             .description(if rows.is_empty() { "No files.".into() } else { rows })
-                            .footer(CreateEmbedFooter::new(format!("Page {page}/{pages} · {used} / {} bytes total (uploads + logs + metadata) · /files view to download", storage::STORAGE_LIMIT_BYTES))));
+                            .footer(CreateEmbedFooter::new(format!("Page {page}/{pages} · {used} / {} bytes total (uploads + logs + metadata) · /files view to download", storage::limit_bytes()))));
                     }
                     Action::Upload(name, data) => {
                         storage::upload(&root, guild.get(), &name, &data)?;

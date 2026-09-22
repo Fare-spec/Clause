@@ -204,15 +204,15 @@ fn storage_embed(usage: &storage::Usage) -> CreateEmbed {
     let mut embed = CreateEmbed::new().title("Guild storage").colour(0x5865F2)
         .field("Available", bytes(usage.available()), false)
         .field("Used", bytes(usage.total), true)
-        .field("Limit", bytes(storage::STORAGE_LIMIT_BYTES), true)
+        .field("Limit", bytes(storage::limit_bytes()), true)
         .field("Uploads", bytes(usage.uploads), true)
         .field("Retained logs", bytes(usage.logs), true)
         .field("Metadata and other files", bytes(usage.other), true)
         .footer(CreateEmbedFooter::new("Snapshot after retention cleanup; this command's audit log may consume additional space."));
-    if usage.total > storage::STORAGE_LIMIT_BYTES {
+    if usage.total > storage::limit_bytes() {
         embed = embed.field(
             "Over quota",
-            bytes(usage.total - storage::STORAGE_LIMIT_BYTES),
+            bytes(usage.total - storage::limit_bytes()),
             false,
         );
     }
@@ -1643,7 +1643,7 @@ mod tests {
         };
         let value = serde_json::to_value(storage_embed(&usage)).unwrap();
         let fields = value["fields"].as_array().unwrap();
-        assert_eq!(fields[0]["value"], "47.00 Mo (46999900 bytes)");
+        assert_eq!(fields[0]["value"], "7.00 Mo (6999900 bytes)");
         assert!(
             fields
                 .iter()

@@ -1,4 +1,4 @@
-use crate::{GuildConfig, Handler, get_guild_config};
+use crate::{GuildConfig, Handler, get_guild_config, storage};
 use serenity::all::*;
 use std::{
     collections::HashMap,
@@ -142,7 +142,7 @@ fn panel(draft: &Draft) -> CreateInteractionResponseMessage {
     CreateInteractionResponseMessage::new().ephemeral(true)
         .allowed_mentions(CreateAllowedMentions::new().all_users(false).all_roles(false).everyone(false))
         .embed(CreateEmbed::new().title(if draft.logging_page { "Set up Clause · 2/2" } else { "Set up Clause · 1/2" }).colour(0x5865F2)
-            .description("Choose your settings, then Save on page 2. Only you can see this panel.\nAdministrators and members with Manage Server retain access and can run /setup.\nRetained logs and uploads share 50 Mo. Saving None clears retained logs; shorter periods expire older records. Flagged-only keeps AI-flagged or gray-area review records.\nChanges save together. Panel expires after 15 minutes.")
+            .description("Choose your settings, then Save on page 2. Only you can see this panel.\nAdministrators and members with Manage Server retain access and can run /setup.\nRetained logs and uploads share the configured guild quota. Saving None clears retained logs; shorter periods expire older records. Flagged-only keeps AI-flagged or gray-area review records.\nChanges save together. Panel expires after 15 minutes.")
             .field("Manager roles", mentions(&c.admin_role_ids, "@&"), false)
             .field("Bot channels", mentions(&c.channel_ids, "#"), false)
             .field("Log channel", mentions(&c.log_channel_id.into_iter().collect::<Vec<_>>(), "#"), false)
@@ -396,7 +396,7 @@ impl Handler {
             }
             sessions.0.remove(&guild);
             return CreateInteractionResponse::UpdateMessage(CreateInteractionResponseMessage::new()
-                .content(format!("Settings saved. Managers: {} · Bot channels: {} · Log channel: <#{}>. Guild storage: 50 Mo. Retention: {}.", mentions(&candidate.admin_role_ids, "@&"), mentions(&candidate.channel_ids, "#"), candidate.log_channel_id.unwrap(), candidate.retention.label()))
+                .content(format!("Settings saved. Managers: {} · Bot channels: {} · Log channel: <#{}>. Guild storage: {}. Retention: {}.", mentions(&candidate.admin_role_ids, "@&"), mentions(&candidate.channel_ids, "#"), candidate.log_channel_id.unwrap(), storage::limit_label(), candidate.retention.label()))
                 .allowed_mentions(CreateAllowedMentions::new().all_users(false).all_roles(false).everyone(false)).embeds(vec![]).components(vec![]));
         }
         draft.config = candidate;

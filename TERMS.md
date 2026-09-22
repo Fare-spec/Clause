@@ -61,7 +61,7 @@ with a legitimate need to see them. Do not redistribute raw logs to all members.
 
 ## Storage and retention limits
 
-Each guild has a shared 50 Mo allowance for uploads, retained logs and metadata.
+Each guild has a shared configurable allowance for uploads, retained logs and metadata. The default is 10 Mo unless the operator changes it before startup.
 Uploads are stored separately from retained logs. The protected size-limit JSON
 cannot be changed through file commands. Uploads do not overwrite existing files.
 At capacity, uploads fail and new retained records may be skipped. The service is

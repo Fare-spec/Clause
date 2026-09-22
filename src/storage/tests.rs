@@ -25,7 +25,7 @@ impl StorageFixture {
         self.0.join("123")
     }
 
-    // Sparse files exercise the real quota without allocating 50 MB of test data.
+    // Sparse files exercise the real quota without allocating 10 MB of test data.
     fn fill_to(&self, total: u64) {
         let file = fs::File::create(self.directory().join("uploads/filler.bin")).unwrap();
         file.set_len(total - usage(&self.directory()).unwrap())
@@ -138,20 +138,20 @@ fn duplicate_upload_does_not_overwrite_existing_file() {
 #[test]
 fn quota_accepts_exact_limit_and_rejects_one_extra_byte_without_partial_file() {
     let fixture = StorageFixture::new();
-    fixture.fill_to(STORAGE_LIMIT_BYTES - 1);
+    fixture.fill_to(limit_bytes() - 1);
     upload(&fixture.0, 123, "last-byte.txt", b"x").unwrap();
-    assert_eq!(list(&fixture.0, 123).unwrap().1, STORAGE_LIMIT_BYTES);
+    assert_eq!(list(&fixture.0, 123).unwrap().1, limit_bytes());
     register(&fixture.0, 123).unwrap();
     assert!(upload(&fixture.0, 123, "overflow.txt", b"x").is_err());
     assert!(!fixture.directory().join("uploads/overflow.txt").exists());
-    assert_eq!(list(&fixture.0, 123).unwrap().1, STORAGE_LIMIT_BYTES);
+    assert_eq!(list(&fixture.0, 123).unwrap().1, limit_bytes());
 }
 
 #[test]
 fn removal_can_recover_an_over_quota_folder() {
     let fixture = StorageFixture::new();
-    fixture.fill_to(STORAGE_LIMIT_BYTES + 1);
-    assert!(register(&fixture.0, 123).is_err());
+    fixture.fill_to(limit_bytes() + 1);
+    register(&fixture.0, 123).unwrap();
     assert!(upload(&fixture.0, 123, "more.txt", b"x").is_err());
     remove(&fixture.0, 123, "filler.bin").unwrap();
     upload(&fixture.0, 123, "more.txt", b"x").unwrap();
@@ -166,9 +166,9 @@ fn nested_files_count_towards_quota_but_directories_cannot_be_removed_as_files()
     fs::create_dir(&nested).unwrap();
     fs::File::create(nested.join("large.bin"))
         .unwrap()
-        .set_len(STORAGE_LIMIT_BYTES - initial)
+        .set_len(limit_bytes() - initial)
         .unwrap();
-    assert_eq!(list(&fixture.0, 123).unwrap().1, STORAGE_LIMIT_BYTES);
+    assert_eq!(list(&fixture.0, 123).unwrap().1, limit_bytes());
     assert!(upload(&fixture.0, 123, "extra.txt", b"x").is_err());
     assert!(read(&fixture.0, 123, "nested").is_err());
     assert!(remove(&fixture.0, 123, "nested").is_err());
@@ -262,7 +262,7 @@ fn storage_breakdown_counts_uploads_logs_and_other_files_per_guild() {
     assert_eq!(report.logs, 7);
     assert_eq!(report.other, metadata);
     assert_eq!(report.total, 12 + metadata);
-    assert_eq!(report.available(), STORAGE_LIMIT_BYTES - 12 - metadata);
+    assert_eq!(report.available(), limit_bytes() - 12 - metadata);
     assert_eq!(stats(&fixture.0, 456).unwrap().uploads, 0);
     assert_eq!(stats(&fixture.0, 456).unwrap().logs, 0);
 }
@@ -270,10 +270,10 @@ fn storage_breakdown_counts_uploads_logs_and_other_files_per_guild() {
 #[test]
 fn available_storage_saturates_at_zero_when_at_or_over_quota() {
     let fixture = StorageFixture::new();
-    fixture.fill_to(STORAGE_LIMIT_BYTES);
+    fixture.fill_to(limit_bytes());
     assert_eq!(stats(&fixture.0, 123).unwrap().available(), 0);
     fs::write(fixture.directory().join("logs/extra.json"), b"x").unwrap();
     let report = stats(&fixture.0, 123).unwrap();
     assert_eq!(report.available(), 0);
-    assert_eq!(report.total, STORAGE_LIMIT_BYTES + 1);
+    assert_eq!(report.total, limit_bytes() + 1);
 }
