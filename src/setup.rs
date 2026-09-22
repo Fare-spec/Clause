@@ -16,6 +16,7 @@ struct Draft {
     started: Instant,
     original: Option<GuildConfig>,
     config: GuildConfig,
+    logging_page: bool,
 }
 
 fn notice(text: &str) -> CreateInteractionResponse {
@@ -51,9 +52,6 @@ fn mentions(ids: &[i64], prefix: &str) -> String {
 
 fn panel(draft: &Draft) -> CreateInteractionResponseMessage {
     let c = &draft.config;
-    let selected = |id: Option<i64>, prefix: &str| {
-        id.map_or("Not selected".into(), |id| format!("<{prefix}{id}>"))
-    };
     let menu = |action: &str, label: &str, kind, maximum| {
         CreateActionRow::SelectMenu(
             CreateSelectMenu::new(format!("setup:{}:{action}", draft.token), kind)
@@ -66,25 +64,92 @@ fn panel(draft: &Draft) -> CreateInteractionResponseMessage {
         channel_types: Some(vec![ChannelType::Text]),
         default_channels: Some(ids.iter().map(|id| ChannelId::new(*id as u64)).collect()),
     };
+    let button = |action: &str, label: &str| {
+        CreateButton::new(format!("setup:{}:{action}", draft.token)).label(label)
+    };
+    let rows = if draft.logging_page {
+        vec![
+            menu(
+                "level",
+                "Discord logging level",
+                CreateSelectMenuKind::String {
+                    options: crate::logging::Level::ALL
+                        .iter()
+                        .map(|level| {
+                            CreateSelectMenuOption::new(level.as_str(), level.as_str())
+                                .description(level.description())
+                                .default_selection(*level == c.log_level)
+                        })
+                        .collect(),
+                },
+                1,
+            ),
+            menu(
+                "retention",
+                "What should be kept on disk, and for how long?",
+                CreateSelectMenuKind::String {
+                    options: crate::retention::Policy::OPTIONS
+                        .iter()
+                        .map(|policy| {
+                            CreateSelectMenuOption::new(policy.label(), policy.key())
+                                .default_selection(*policy == c.retention)
+                        })
+                        .collect(),
+                },
+                1,
+            ),
+            CreateActionRow::Buttons(vec![
+                button("back", "Back"),
+                button("save", "Save settings")
+                    .style(ButtonStyle::Success)
+                    .disabled(!complete(c)),
+                button("cancel", "Cancel").style(ButtonStyle::Secondary),
+            ]),
+        ]
+    } else {
+        vec![
+            menu(
+                "role",
+                "1 · Select manager roles (up to 25)",
+                CreateSelectMenuKind::Role {
+                    default_roles: Some(
+                        c.admin_role_ids
+                            .iter()
+                            .map(|id| RoleId::new(*id as u64))
+                            .collect(),
+                    ),
+                },
+                25,
+            ),
+            menu(
+                "channel",
+                "2 · Select bot channels (up to 25)",
+                channel_kind(&c.channel_ids),
+                25,
+            ),
+            menu(
+                "logs",
+                "3 · Select the log channel",
+                channel_kind(&c.log_channel_id.into_iter().collect::<Vec<_>>()),
+                1,
+            ),
+            CreateActionRow::Buttons(vec![
+                button("next", "Next: logging & retention").style(ButtonStyle::Primary),
+                button("cancel", "Cancel").style(ButtonStyle::Secondary),
+            ]),
+        ]
+    };
     CreateInteractionResponseMessage::new().ephemeral(true)
         .allowed_mentions(CreateAllowedMentions::new().all_users(false).all_roles(false).everyone(false))
-        .embed(CreateEmbed::new().title("Set up Clause").colour(0x5865F2)
-            .description("Choose all three settings below, then Save. Only you can see this panel.\nServer administrators and members with Manage Server always retain access. Only they can run /setup.\nChanges are saved together. This panel expires after 15 minutes.")
-            .field("1 · Who can manage the bot?", mentions(&c.admin_role_ids, "@&"), false)
-            .field("2 · Where should bot commands work?", mentions(&c.channel_ids, "#"), false)
-            .field("3 · Where should logs go?", selected(c.log_channel_id, "#"), false)
-            .footer(CreateEmbedFooter::new("Logging destination is stored; moderation and event logging are not implemented yet.")))
-        .components(vec![
-            menu("role", "1 · Select manager roles (up to 25)", CreateSelectMenuKind::Role {
-                default_roles: Some(c.admin_role_ids.iter().map(|id| RoleId::new(*id as u64)).collect()),
-            }, 25),
-            menu("channel", "2 · Select bot channels (up to 25)", channel_kind(&c.channel_ids), 25),
-            menu("logs", "3 · Select the log channel", channel_kind(&c.log_channel_id.into_iter().collect::<Vec<_>>()), 1),
-            CreateActionRow::Buttons(vec![
-                CreateButton::new(format!("setup:{}:save", draft.token)).label("Save settings").style(ButtonStyle::Success).disabled(!complete(c)),
-                CreateButton::new(format!("setup:{}:cancel", draft.token)).label("Cancel").style(ButtonStyle::Secondary),
-            ]),
-        ])
+        .embed(CreateEmbed::new().title(if draft.logging_page { "Set up Clause · 2/2" } else { "Set up Clause · 1/2" }).colour(0x5865F2)
+            .description("Choose your settings, then Save on page 2. Only you can see this panel.\nAdministrators and members with Manage Server retain access and can run /setup.\nRetained logs and uploads share 50 Mo. Saving None clears retained logs; shorter periods expire older records. Flagged-only keeps AI-flagged or gray-area review records.\nChanges save together. Panel expires after 15 minutes.")
+            .field("Manager roles", mentions(&c.admin_role_ids, "@&"), false)
+            .field("Bot channels", mentions(&c.channel_ids, "#"), false)
+            .field("Log channel", mentions(&c.log_channel_id.into_iter().collect::<Vec<_>>(), "#"), false)
+            .field("Discord logging level", c.log_level.as_str(), true)
+            .field("Disk retention", c.retention.label(), false)
+            .footer(CreateEmbedFooter::new("Discord messages are not deleted by disk retention. Restrict your log channel to trusted members.")))
+        .components(rows)
 }
 
 // Validate against the guild cache, including channel permission overwrites.
@@ -123,6 +188,16 @@ fn validate(ctx: &Context, guild_id: GuildId, config: &GuildConfig) -> Result<()
             return Err(
                 "The bot needs View Channel and Send Messages in every selected channel. Update permissions or choose another channel.",
             );
+        }
+    }
+    if let Some(id) = config.log_channel_id {
+        if let Some(channel) = guild.channels.get(&ChannelId::new(id as u64)) {
+            if !guild
+                .user_permissions_in(channel, bot)
+                .contains(Permissions::EMBED_LINKS)
+            {
+                return Err("The bot needs Embed Links in the log channel to send logs.");
+            }
         }
     }
     Ok(())
@@ -166,6 +241,7 @@ impl Handler {
         };
         let draft = Draft {
             owner: command.user.id,
+            logging_page: false,
             token: command.id.to_string(),
             started: Instant::now(),
             config: original.clone().unwrap_or(GuildConfig {
@@ -174,6 +250,8 @@ impl Handler {
                 admin_role_ids: vec![],
                 channel_ids: vec![],
                 log_channel_id: None,
+                log_level: crate::logging::Level::Info,
+                retention: crate::retention::Policy::None,
             }),
             original,
         };
@@ -207,6 +285,12 @@ impl Handler {
             return notice("This panel is no longer active for you. Run /setup again.");
         }
         let action = parts[2];
+        if matches!(component.data.kind, ComponentInteractionDataKind::Button)
+            && matches!(action, "next" | "back")
+        {
+            draft.logging_page = action == "next";
+            return CreateInteractionResponse::UpdateMessage(panel(draft));
+        }
         let mut candidate = draft.config.clone();
         match (action, &component.data.kind) {
             ("role", ComponentInteractionDataKind::RoleSelect { values })
@@ -227,6 +311,22 @@ impl Handler {
                 if values.len() == 1 =>
             {
                 candidate.log_channel_id = Some(values[0].get() as i64)
+            }
+            ("level", ComponentInteractionDataKind::StringSelect { values })
+                if values.len() == 1 =>
+            {
+                let Some(level) = crate::logging::Level::parse(&values[0]) else {
+                    return notice("Select a valid logging level.");
+                };
+                candidate.log_level = level;
+            }
+            ("retention", ComponentInteractionDataKind::StringSelect { values })
+                if values.len() == 1 =>
+            {
+                let Some(policy) = crate::retention::Policy::parse(&values[0]) else {
+                    return notice("Select a valid retention policy.");
+                };
+                candidate.retention = policy;
             }
             ("cancel", ComponentInteractionDataKind::Button) => {
                 sessions.0.remove(&guild);
@@ -271,9 +371,21 @@ impl Handler {
                         "Settings changed since this panel was opened. Run /setup again.".into(),
                     );
                 }
+                let _storage = self
+                    .storage_lock
+                    .lock()
+                    .map_err(|_| "Storage unavailable")?;
                 crate::storage::register(&self.storage_root, guild.get())?;
                 save_config(&tx, &candidate)?;
                 tx.commit()?;
+                if let Err(error) = crate::retention::prune(
+                    &self.storage_root,
+                    guild.get(),
+                    candidate.retention,
+                    crate::retention::now(),
+                ) {
+                    eprintln!("Retention cleanup failed for guild {guild}: {error}");
+                }
                 Ok(())
             })();
             if let Err(error) = result {
@@ -284,7 +396,7 @@ impl Handler {
             }
             sessions.0.remove(&guild);
             return CreateInteractionResponse::UpdateMessage(CreateInteractionResponseMessage::new()
-                .content(format!("Settings saved. Managers: {} · Bot channels: {} · Log channel: <#{}>. Guild storage: 50 MB.", mentions(&candidate.admin_role_ids, "@&"), mentions(&candidate.channel_ids, "#"), candidate.log_channel_id.unwrap()))
+                .content(format!("Settings saved. Managers: {} · Bot channels: {} · Log channel: <#{}>. Guild storage: 50 Mo. Retention: {}.", mentions(&candidate.admin_role_ids, "@&"), mentions(&candidate.channel_ids, "#"), candidate.log_channel_id.unwrap(), candidate.retention.label()))
                 .allowed_mentions(CreateAllowedMentions::new().all_users(false).all_roles(false).everyone(false)).embeds(vec![]).components(vec![]));
         }
         draft.config = candidate;
@@ -300,10 +412,10 @@ fn save_config(db: &rusqlite::Connection, config: &GuildConfig) -> rusqlite::Res
     db.execute_batch("SAVEPOINT save_configuration")?;
     let result = (|| -> rusqlite::Result<()> {
         db.execute(
-            "INSERT INTO guild_configs (guild_id, setup_completed, log_channel_id)
-            VALUES (?1, 1, ?2) ON CONFLICT(guild_id) DO UPDATE SET
-            setup_completed = 1, log_channel_id = excluded.log_channel_id",
-            rusqlite::params![config.guild_id, config.log_channel_id],
+            "INSERT INTO guild_configs (guild_id, setup_completed, log_channel_id, log_level, retention)
+            VALUES (?1, 1, ?2, ?3, ?4) ON CONFLICT(guild_id) DO UPDATE SET
+            setup_completed = 1, log_channel_id = excluded.log_channel_id, log_level = excluded.log_level, retention = excluded.retention",
+            rusqlite::params![config.guild_id, config.log_channel_id, config.log_level.as_str(), config.retention.key()],
         )?;
         db.execute(
             "DELETE FROM guild_manager_roles WHERE guild_id = ?1",
@@ -338,6 +450,36 @@ fn save_config(db: &rusqlite::Connection, config: &GuildConfig) -> rusqlite::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn setup_pages_fit_discord_limits_and_expose_retention_before_saving() {
+        let mut draft = Draft {
+            owner: UserId::new(1),
+            token: "test".into(),
+            started: Instant::now(),
+            original: None,
+            logging_page: false,
+            config: GuildConfig {
+                guild_id: 1,
+                setup_completed: false,
+                admin_role_ids: vec![2],
+                channel_ids: vec![3],
+                log_channel_id: Some(4),
+                log_level: crate::logging::Level::Info,
+                retention: crate::retention::Policy::None,
+            },
+        };
+        let first = serde_json::to_value(panel(&draft)).unwrap();
+        assert!(first["components"].as_array().unwrap().len() <= 5);
+        assert!(!first.to_string().contains("test:save"));
+        draft.logging_page = true;
+        let second = serde_json::to_value(panel(&draft)).unwrap();
+        assert!(second["components"].as_array().unwrap().len() <= 5);
+        assert!(second.to_string().contains("test:retention"));
+        assert!(second.to_string().contains("test:save"));
+        assert!(second.to_string().contains("flagged:30"));
+        assert!(second.to_string().contains("all:7"));
+    }
+
     #[test]
     fn setup_requires_manage_server_even_if_command_visibility_is_overridden() {
         assert!(!can_setup(None));
@@ -382,6 +524,10 @@ mod tests {
             assert_eq!(config.admin_role_ids, vec![2]);
             assert_eq!(config.channel_ids, vec![3]);
             assert_eq!(config.log_channel_id, Some(4));
+            assert_eq!(config.log_level, crate::logging::Level::Info);
+            assert_eq!(config.retention, crate::retention::Policy::None);
+            config.retention = crate::retention::Policy::All(7);
+            config.log_level = crate::logging::Level::Debug;
             config.admin_role_ids = vec![7, 8];
             config.channel_ids = vec![9, 10];
             save_config(&db, &config).unwrap();
@@ -391,6 +537,8 @@ mod tests {
             let config = get_guild_config(&db, 1).unwrap().unwrap();
             assert_eq!(config.admin_role_ids, vec![7, 8]);
             assert_eq!(config.channel_ids, vec![9, 10]);
+            assert_eq!(config.log_level, crate::logging::Level::Debug);
+            assert_eq!(config.retention, crate::retention::Policy::All(7));
         }
         std::fs::remove_file(path).unwrap();
     }
@@ -404,6 +552,8 @@ mod tests {
             admin_role_ids: vec![2, 7],
             channel_ids: vec![3, 8],
             log_channel_id: Some(4),
+            log_level: crate::logging::Level::Info,
+            retention: crate::retention::Policy::None,
         };
         save_config(&db, &config).unwrap();
         config.setup_completed = true;

@@ -1,3 +1,9 @@
+mod ai;
+mod files;
+mod logging;
+mod public_commands;
+mod retention;
+mod rules;
 mod setup;
 mod storage;
 
@@ -10,7 +16,10 @@ use std::{
 use rusqlite::{Connection, params};
 
 use serenity::{
-    all::{Command, CreateCommand, GatewayIntents, Interaction, Message, Permissions, Ready},
+    all::{
+        Command, CreateAllowedMentions, CreateCommand, CreateMessage, GatewayIntents, GuildId,
+        Interaction, Message, Permissions, Ready, RoleId,
+    },
     async_trait,
     prelude::*,
 };
@@ -26,8 +35,18 @@ struct GuildConfig {
     pub guild_id: i64,
     pub setup_completed: bool,
     pub log_channel_id: Option<i64>,
+    pub log_level: logging::Level,
+    pub retention: retention::Policy,
     pub channel_ids: Vec<i64>,
     pub admin_role_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GuildAiConfig {
+    pub guild_id: i64,
+    pub endpoint: String,
+    pub api_key: String,
+    pub model: String,
 }
 
 /// Opens the database and creates the required table if necessary.
@@ -57,6 +76,11 @@ fn early_init(database: &str) -> rusqlite::Result<Connection> {
         CREATE TABLE IF NOT EXISTS guild_bot_channels (
             guild_id INTEGER NOT NULL, channel_id INTEGER NOT NULL,
             PRIMARY KEY (guild_id, channel_id));
+        CREATE TABLE IF NOT EXISTS guild_ai_configs (
+            guild_id INTEGER PRIMARY KEY,
+            endpoint TEXT NOT NULL,
+            api_key TEXT NOT NULL,
+            model TEXT NOT NULL);
         INSERT OR IGNORE INTO guild_manager_roles SELECT guild_id, admin_role_id
             FROM guild_configs WHERE admin_role_id IS NOT NULL;
         INSERT OR IGNORE INTO guild_bot_channels SELECT guild_id, channel_to_manage
@@ -64,6 +88,30 @@ fn early_init(database: &str) -> rusqlite::Result<Connection> {
         UPDATE guild_configs SET admin_role_id = NULL, channel_to_manage = NULL;
         COMMIT;",
     )?;
+    let has_level = conn
+        .prepare("PRAGMA table_info(guild_configs)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "log_level");
+    if !has_level {
+        conn.execute(
+            "ALTER TABLE guild_configs ADD COLUMN log_level TEXT NOT NULL DEFAULT 'info'",
+            [],
+        )?;
+    }
+    let has_retention = conn
+        .prepare("PRAGMA table_info(guild_configs)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "retention");
+    if !has_retention {
+        conn.execute(
+            "ALTER TABLE guild_configs ADD COLUMN retention TEXT NOT NULL DEFAULT 'none'",
+            [],
+        )?;
+    }
     Ok(conn)
 }
 
@@ -74,7 +122,7 @@ fn get_guild_config(conn: &Connection, guild_id: i64) -> rusqlite::Result<Option
             SELECT
                 guild_id,
                 setup_completed,
-                log_channel_id
+                log_channel_id, log_level, retention
             FROM {TABLE_NAME}
             WHERE guild_id = ?1
             "
@@ -90,6 +138,9 @@ fn get_guild_config(conn: &Connection, guild_id: i64) -> rusqlite::Result<Option
         guild_id: row.get(0)?,
         setup_completed: row.get(1)?,
         log_channel_id: row.get(2)?,
+        log_level: logging::Level::parse(&row.get::<_, String>(3)?).unwrap_or(logging::Level::Off),
+        retention: retention::Policy::parse(&row.get::<_, String>(4)?)
+            .unwrap_or(retention::Policy::None),
         channel_ids: read_ids(conn, "guild_bot_channels", "channel_id", guild_id)?,
         admin_role_ids: read_ids(conn, "guild_manager_roles", "role_id", guild_id)?,
     }))
@@ -108,14 +159,158 @@ fn read_ids(
     .collect()
 }
 
+pub(crate) fn get_ai_config(
+    conn: &Connection,
+    guild_id: i64,
+) -> rusqlite::Result<Option<GuildAiConfig>> {
+    let mut statement = conn.prepare(
+        "SELECT guild_id, endpoint, api_key, model FROM guild_ai_configs WHERE guild_id = ?1",
+    )?;
+    let mut rows = statement.query([guild_id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    Ok(Some(GuildAiConfig {
+        guild_id: row.get(0)?,
+        endpoint: row.get(1)?,
+        api_key: row.get(2)?,
+        model: row.get(3)?,
+    }))
+}
+
+pub(crate) fn save_ai_config(conn: &Connection, config: &GuildAiConfig) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO guild_ai_configs (guild_id, endpoint, api_key, model)
+        VALUES (?1, ?2, ?3, ?4) ON CONFLICT(guild_id) DO UPDATE SET
+        endpoint = excluded.endpoint, api_key = excluded.api_key, model = excluded.model",
+        params![
+            config.guild_id,
+            config.endpoint,
+            config.api_key,
+            config.model
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn delete_ai_config(conn: &Connection, guild_id: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM guild_ai_configs WHERE guild_id = ?1",
+        [guild_id],
+    )?;
+    Ok(())
+}
+
 // ============================================================
 // DISCORD HANDLER
 // ============================================================
+
+fn truncate_utf16(text: &str, limit: usize) -> String {
+    let mut result = String::new();
+    let mut units = 0;
+    for character in text.chars() {
+        units += character.len_utf16();
+        if units > limit {
+            result.push_str("…");
+            break;
+        }
+        result.push(character);
+    }
+    result
+}
+
+fn rule_ids(review: &ai::MessageReview) -> String {
+    if review.rule_ids.is_empty() {
+        "unknown".into()
+    } else {
+        review
+            .rule_ids
+            .iter()
+            .map(|id| format!("`{id}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn message_for_ai(message: &Message) -> Option<String> {
+    let content = message.content.trim();
+    if content.is_empty() && message.attachments.is_empty() {
+        return None;
+    }
+    let mut text = String::new();
+    if !content.is_empty() {
+        text.push_str("Content:\n");
+        text.push_str(content);
+        text.push('\n');
+    }
+    if !message.attachments.is_empty() {
+        text.push_str("Attachments:\n");
+        for attachment in &message.attachments {
+            let content_type = attachment.content_type.as_deref().unwrap_or("unknown type");
+            text.push_str(&format!(
+                "- {} ({}; {} bytes)\n",
+                attachment.filename, content_type, attachment.size
+            ));
+        }
+    }
+    Some(text)
+}
+
+fn moderation_report(guild: GuildId, message: &Message, review: &ai::MessageReview) -> String {
+    let link = format!(
+        "https://discord.com/channels/{}/{}/{}",
+        guild.get(),
+        message.channel_id.get(),
+        message.id.get()
+    );
+    let quotes = if review.quoted_rules.is_empty() {
+        "No exact rule quote returned by AI.".into()
+    } else {
+        review
+            .quoted_rules
+            .iter()
+            .map(|quote| format!("- `{}`: {}", quote.id, truncate_utf16(&quote.text, 500)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "AI rule review: {}\nSeverity: {}\nAuthor: <@{}> ({})\nChannel: <#{}>\nMessage: {}\nMatched rules: {}\nReason: {}\nQuoted rules:\n{}",
+        review.label().to_uppercase(),
+        review.severity,
+        message.author.id.get(),
+        message.author.id.get(),
+        message.channel_id.get(),
+        link,
+        rule_ids(review),
+        truncate_utf16(&review.reason, 800),
+        quotes
+    )
+}
+
+fn moderation_response(review: &ai::MessageReview) -> String {
+    match review.status {
+        ai::ReviewStatus::Violation => format!(
+            "Clause flagged this message for staff review because it appears to break server rules. Reason: {}\nMatched rules: {}.",
+            truncate_utf16(&review.reason, 900),
+            rule_ids(review)
+        ),
+        ai::ReviewStatus::GrayArea => format!(
+            "Clause is not sure this message fits the server rules, so staff have been asked to review it. Reason: {}\nPossible rules: {}.",
+            truncate_utf16(&review.reason, 900),
+            rule_ids(review)
+        ),
+        ai::ReviewStatus::Compliant => String::new(),
+    }
+}
 
 struct Handler {
     database: Arc<Mutex<Connection>>,
     setup: Mutex<setup::Sessions>,
     storage_root: std::path::PathBuf,
+    storage_lock: Arc<Mutex<()>>,
+    logger: logging::Logger,
+    ai: ai::Ai,
+    rules: Arc<Mutex<rules::Cache>>,
 }
 
 #[async_trait]
@@ -126,19 +321,41 @@ impl EventHandler for Handler {
 
     async fn ready(&self, ctx: Context, ready: Ready) {
         println!("Connected as {}", ready.user.name);
+        for guild in &ready.guilds {
+            self.logger.log(
+                &ctx,
+                guild.id,
+                logging::Level::Info,
+                "Bot connected to Discord.",
+            );
+        }
 
         let setup_command = CreateCommand::new("setup")
             .description("Setup the bot for this server.")
             .default_member_permissions(Permissions::MANAGE_GUILD)
             .dm_permission(false);
 
-        match Command::create_global_command(&ctx.http, setup_command).await {
-            Ok(_) => {
-                println!("Registered /setup command");
-            }
+        let mut commands = public_commands::commands();
+        commands.push(files::command());
+        commands.push(setup_command);
 
-            Err(error) => {
-                eprintln!("Failed to register /setup: {error}");
+        if let Some(guild) = command_guild_id() {
+            match guild.set_commands(&ctx.http, commands).await {
+                Ok(commands) => {
+                    println!(
+                        "Registered {} guild command(s) for guild {}",
+                        commands.len(),
+                        guild
+                    );
+                }
+                Err(error) => eprintln!("Failed to register guild commands: {error}"),
+            }
+        } else {
+            match Command::set_global_commands(&ctx.http, commands).await {
+                Ok(commands) => {
+                    println!("Registered {} global command(s)", commands.len());
+                }
+                Err(error) => eprintln!("Failed to register global commands: {error}"),
             }
         }
     }
@@ -149,13 +366,73 @@ impl EventHandler for Handler {
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         let result = match interaction {
+            Interaction::Command(command)
+                if matches!(
+                    command.data.name.as_str(),
+                    "storage"
+                        | "settings"
+                        | "summary"
+                        | "rules"
+                        | "ai"
+                        | "logs"
+                        | "privacy"
+                        | "terms"
+                ) =>
+            {
+                self.public_command(&ctx, &command).await;
+                return;
+            }
+            Interaction::Command(command) if command.data.name == "files" => {
+                self.files_command(&ctx, &command).await;
+                return;
+            }
             Interaction::Command(command) if command.data.name == "setup" => {
                 let response = self.setup_response(&ctx, &command);
-                command.create_response(&ctx.http, response).await
+                let outcome = logging::setup_outcome(&response);
+                let level = logging::setup_level(&response);
+                let result = command.create_response(&ctx.http, response).await;
+                if let Some(guild) = command.guild_id {
+                    self.logger.log(
+                        &ctx,
+                        guild,
+                        if result.is_ok() {
+                            level
+                        } else {
+                            logging::Level::Error
+                        },
+                        format!(
+                            "/setup for user {} in channel {}: {outcome}; response {}",
+                            command.user.id,
+                            command.channel_id,
+                            if result.is_ok() { "sent" } else { "failed" }
+                        ),
+                    );
+                }
+                result
             }
             Interaction::Component(component) if component.data.custom_id.starts_with("setup:") => {
                 let response = self.setup_component(&ctx, &component);
-                component.create_response(&ctx.http, response).await
+                let outcome = logging::setup_outcome(&response);
+                let level = logging::setup_level(&response);
+                let result = component.create_response(&ctx.http, response).await;
+                if let Some(guild) = component.guild_id {
+                    self.logger.log(
+                        &ctx,
+                        guild,
+                        if result.is_ok() {
+                            level
+                        } else {
+                            logging::Level::Error
+                        },
+                        format!(
+                            "Setup action by user {} in channel {}: {outcome}; response {}",
+                            component.user.id,
+                            component.channel_id,
+                            if result.is_ok() { "sent" } else { "failed" }
+                        ),
+                    );
+                }
+                result
             }
             _ => return,
         };
@@ -169,17 +446,10 @@ impl EventHandler for Handler {
     // --------------------------------------------------------
 
     async fn message(&self, ctx: Context, message: Message) {
-        // Ignore bots.
         if message.author.bot {
             return;
         }
-
-        // Ignore DMs.
-        if message.guild_id.is_none() {
-            return;
-        }
-
-        let Some(permissions) = message.author_permissions(&ctx) else {
+        let Some(guild) = message.guild_id else {
             return;
         };
 
@@ -187,104 +457,205 @@ impl EventHandler for Handler {
             let Ok(database) = self.database.lock() else {
                 return;
             };
-            match get_guild_config(&database, message.guild_id.unwrap().get() as i64) {
-                Ok(config) => config,
+            match get_guild_config(&database, guild.get() as i64) {
+                Ok(Some(config)) if config.setup_completed => config,
+                Ok(_) => return,
                 Err(error) => {
                     eprintln!("Failed to read configuration: {error}");
                     return;
                 }
             }
         };
-        let manager = config.as_ref().is_some_and(|config| {
-            message.member.as_ref().is_some_and(|member| {
-                member
-                    .roles
-                    .iter()
-                    .any(|id| config.admin_role_ids.contains(&(id.get() as i64)))
-            })
-        });
-        if !(permissions.administrator() || permissions.manage_guild() || manager) {
+        let in_bot_channel = config
+            .channel_ids
+            .contains(&(message.channel_id.get() as i64));
+        if !in_bot_channel {
             return;
         }
-        if let Some(config) = &config {
-            if config.setup_completed
-                && !config
-                    .channel_ids
-                    .contains(&(message.channel_id.get() as i64))
-            {
-                return;
-            }
-        }
+        let permissions = message.author_permissions(&ctx).unwrap_or_default();
+        let manager_role = message.member.as_ref().is_some_and(|member| {
+            member
+                .roles
+                .iter()
+                .any(|id| config.admin_role_ids.contains(&(id.get() as i64)))
+        });
+        let manager = permissions.administrator() || permissions.manage_guild() || manager_role;
 
         match message.content.as_str() {
-            "!ping" => {
-                if let Err(error) = message.channel_id.say(&ctx.http, "Pong!").await {
-                    eprintln!("Failed to send ping reply: {error}");
-                }
+            "!ping" if manager => {
+                let result = message.channel_id.say(&ctx.http, "Pong!").await;
+                self.logger.log(
+                    &ctx,
+                    guild,
+                    if result.is_ok() {
+                        logging::Level::Info
+                    } else {
+                        logging::Level::Error
+                    },
+                    format!(
+                        "!ping reply for user {} in channel {}: {}",
+                        message.author.id,
+                        message.channel_id,
+                        if result.is_ok() { "sent" } else { "failed" }
+                    ),
+                );
+                return;
             }
-
-            "!config" => {
-                let Some(guild_id) = message.guild_id else {
-                    return;
-                };
-
-                let guild_id = guild_id.get() as i64;
-
-                let config = {
-                    let database = match self.database.lock() {
-                        Ok(database) => database,
-
-                        Err(error) => {
-                            eprintln!("Failed to lock database: {error}");
-
-                            return;
-                        }
-                    };
-
-                    get_guild_config(&database, guild_id)
-                };
-
-                match config {
-                    Ok(Some(config)) => {
-                        let content = format!(
-                            "\
+            "!config" if manager => {
+                let content = format!(
+                    "\
 Guild ID: {}
 Setup completed: {}
 Log channel: {:?}
 Bot channels: {:?}
-Manager roles: {:?}",
-                            config.guild_id,
-                            config.setup_completed,
-                            config.log_channel_id,
-                            config.channel_ids,
-                            config.admin_role_ids,
-                        );
-
-                        if let Err(error) = message.channel_id.say(&ctx.http, content).await {
-                            eprintln!("Failed to send config: {error}");
-                        }
-                    }
-
-                    Ok(None) => {
-                        if let Err(error) = message
-                            .channel_id
-                            .say(
-                                &ctx.http,
-                                "This server has not been configured. Use /setup.",
-                            )
-                            .await
-                        {
-                            eprintln!("Failed to send reply: {error}");
-                        }
-                    }
-
-                    Err(error) => {
-                        eprintln!("Failed to read config: {error}");
-                    }
-                }
+Manager roles: {:?}
+Logging level: {}
+Retention: {}",
+                    config.guild_id,
+                    config.setup_completed,
+                    config.log_channel_id,
+                    config.channel_ids,
+                    config.admin_role_ids,
+                    config.log_level.as_str(),
+                    config.retention.label(),
+                );
+                let result = message.channel_id.say(&ctx.http, content).await;
+                self.logger.log(
+                    &ctx,
+                    guild,
+                    if result.is_ok() {
+                        logging::Level::Info
+                    } else {
+                        logging::Level::Error
+                    },
+                    format!(
+                        "!config reply for user {} in channel {}: {}",
+                        message.author.id,
+                        message.channel_id,
+                        if result.is_ok() { "sent" } else { "failed" }
+                    ),
+                );
+                return;
             }
-
             _ => {}
+        }
+
+        let Some(message_text) = message_for_ai(&message) else {
+            return;
+        };
+
+        let root = self.storage_root.clone();
+        let lock = self.storage_lock.clone();
+        let cache = self.rules.clone();
+        let rulebook = tokio::task::spawn_blocking(move || {
+            let _guard = lock.lock().map_err(|_| crate::ai::SummaryError::Storage)?;
+            let mut cache = cache.lock().map_err(|_| crate::ai::SummaryError::Storage)?;
+            let book = cache
+                .get(&root, guild.get())
+                .map_err(|_| crate::ai::SummaryError::Storage)?;
+            if book.rules.is_empty() {
+                return Err(crate::ai::SummaryError::NoRuleFiles);
+            }
+            Ok(rules::to_ai_text(&book))
+        })
+        .await
+        .map_err(|_| crate::ai::SummaryError::Storage)
+        .and_then(|result| result);
+
+        let Ok(rulebook) = rulebook else {
+            return;
+        };
+        let ai_config = self.guild_ai_config(guild);
+        let review = self
+            .ai
+            .review_message(&rulebook, &message_text, ai_config.as_ref())
+            .await;
+        let review = match review {
+            Ok(review) if review.needs_action() => review,
+            Ok(_)
+            | Err(crate::ai::SummaryError::MissingConfig | crate::ai::SummaryError::NoRuleFiles) => {
+                return;
+            }
+            Err(error) => {
+                let level = match error {
+                    crate::ai::SummaryError::BadResponse
+                    | crate::ai::SummaryError::ProviderRequest(_)
+                    | crate::ai::SummaryError::ProviderResponse(_) => logging::Level::Error,
+                    _ => logging::Level::Warn,
+                };
+                let detail = match &error {
+                    crate::ai::SummaryError::ProviderRequest(diagnostic)
+                    | crate::ai::SummaryError::ProviderResponse(diagnostic) => {
+                        diagnostic.to_string()
+                    }
+                    _ => format!("{error:?}"),
+                };
+                self.logger.log(
+                    &ctx,
+                    guild,
+                    level,
+                    format!(
+                        "AI rule review skipped for message {} by user {} in channel {}: {detail}",
+                        message.id, message.author.id, message.channel_id
+                    ),
+                );
+                return;
+            }
+        };
+
+        let mention_roles = config
+            .admin_role_ids
+            .iter()
+            .filter_map(|id| u64::try_from(*id).ok())
+            .map(RoleId::new)
+            .collect::<Vec<_>>();
+        let report = moderation_report(guild, &message, &review);
+        self.logger.managed_message_with_mentions(
+            &ctx,
+            &message,
+            &report,
+            logging::Level::Warn,
+            mention_roles,
+        );
+
+        let response = moderation_response(&review);
+        let send_result = message
+            .channel_id
+            .send_message(
+                &ctx.http,
+                CreateMessage::new()
+                    .content(response)
+                    .reference_message(&message)
+                    .allowed_mentions(
+                        CreateAllowedMentions::new()
+                            .all_users(false)
+                            .all_roles(false)
+                            .everyone(false)
+                            .replied_user(false),
+                    ),
+            )
+            .await;
+        if send_result.is_err() {
+            self.logger.log(
+                &ctx,
+                guild,
+                logging::Level::Error,
+                format!(
+                    "Could not send active AI rule response for message {} in channel {}.",
+                    message.id, message.channel_id
+                ),
+            );
+        }
+    }
+}
+
+fn command_guild_id() -> Option<GuildId> {
+    let value = env::var("COMMAND_GUILD_ID").ok()?;
+    match value.trim().parse::<u64>() {
+        Ok(id) if id != 0 => Some(GuildId::new(id)),
+        _ => {
+            eprintln!("Ignoring invalid COMMAND_GUILD_ID; registering global commands.");
+            None
         }
     }
 }
@@ -344,15 +715,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let intents =
         GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
 
+    let storage_root: std::path::PathBuf = env::var_os("GUILD_STORAGE_PATH")
+        .map(Into::into)
+        .unwrap_or_else(|| "guilds".into());
+    let storage_lock = Arc::new(Mutex::new(()));
+    let logger = logging::Logger::new(database.clone(), storage_root.clone(), storage_lock.clone());
     let handler = Handler {
+        logger: logger.clone(),
+        ai: ai::Ai::from_env(),
         database,
+        rules: Arc::new(Mutex::new(rules::Cache::default())),
         setup: Mutex::new(setup::Sessions::default()),
-        storage_root: env::var_os("GUILD_STORAGE_PATH")
-            .map(Into::into)
-            .unwrap_or_else(|| "guilds".into()),
+        storage_lock,
+        storage_root,
     };
 
     let mut client = Client::builder(token, intents)
+        .raw_event_handler(logger)
         .event_handler(handler)
         .await?;
 

@@ -1,5 +1,7 @@
 *
 !Cargo.toml
 !Cargo.lock
+!PRIVACY.md
+!TERMS.md
 !src/
 !src/**

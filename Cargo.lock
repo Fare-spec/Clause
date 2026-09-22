@@ -205,7 +205,10 @@ name = "clause"
 version = "0.1.0"
 dependencies = [
  "genai",
+ "reqwest 0.12.28",
  "rusqlite",
+ "serde",
+ "serde_json",
  "serenity",
  "tokio",
 ]
