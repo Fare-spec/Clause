@@ -68,6 +68,35 @@ Without those values, the bot still starts. `/summary`, `/rules generate`,
 is not configured. Bot managers can override the endpoint, model, and API key for
 one server with `/ai set`; `/ai show` never reveals the stored key.
 
+
+## GitHub Container Registry image
+
+The GitHub Actions workflow in `.github/workflows/docker-image.yml` builds the
+Dockerfile on pull requests and publishes an image to GitHub Container Registry
+on pushes to `main`, `master`, and `v*.*.*` tags. Published images are tagged
+with the branch name, Git tag, commit SHA, and `latest` on the default branch.
+
+After pushing to GitHub, pull the image with:
+
+```sh
+docker pull ghcr.io/fare-spec/clause:latest
+```
+
+To run the published image with Compose instead of building locally, use the
+provided GHCR Compose file:
+
+```sh
+docker compose -f docker-compose.ghcr.yml pull
+docker compose -f docker-compose.ghcr.yml up -d
+```
+
+That file uses `ghcr.io/fare-spec/clause:latest` and keeps the same `.env`,
+`clause-data`, and `clause-guilds` volumes as the local build compose file.
+
+Keep `DISCORD_TOKEN`, `API_KEY`, and provider settings in `.env` or deployment
+secrets. They are not needed at image build time and should not be baked into the
+image.
+
 ## Configure a server
 
 Run `/setup` as a server administrator or a member with **Manage Server**.

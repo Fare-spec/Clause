@@ -1,0 +1,17 @@
+services:
+  clause:
+    image: ghcr.io/fare-spec/clause:latest
+    network_mode: host
+    container_name: clause
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 20s
+    env_file:
+      - .env
+    volumes:
+      - clause-data:/app/data
+      - clause-guilds:/app/guilds
+
+volumes:
+  clause-data:
+  clause-guilds:
