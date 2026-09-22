@@ -5,4 +5,12 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
-serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "rustls_backend"] }
+serenity = { version = "0.12", default-features = false, features = [
+  "client",
+  "gateway",
+  "model",
+  "rustls_backend",
+  "cache",
+] }
+genai = "0.6.5"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
