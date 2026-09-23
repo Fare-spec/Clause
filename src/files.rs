@@ -1,4 +1,4 @@
-use crate::{GuildConfig, Handler, get_guild_config, storage};
+use crate::{GuildConfig, Handler, get_guild_config, metrics, storage};
 use serenity::all::*;
 use std::time::Duration;
 
@@ -233,6 +233,9 @@ impl Handler {
             }
             return;
         }
+        if let Some(guild) = command.guild_id {
+            self.record_metric(guild, metrics::Counter::CommandsUsed, 1);
+        }
         let result = self.run_files(command).await;
         if let Some(guild) = command.guild_id {
             let action = command
@@ -339,10 +342,12 @@ impl Handler {
                     }
                     Action::Upload(name, data) => {
                         storage::upload(&root, guild.get(), &name, &data)?;
+                        let _ = metrics::increment(&db, guild.get() as i64, metrics::Counter::UploadsAdded, 1);
                         reply = reply.clone().content(format!("Uploaded `{name}` ({} bytes).", data.len()));
                     }
                     Action::Remove(name) => {
                         storage::remove(&root, guild.get(), &name)?;
+                        let _ = metrics::increment(&db, guild.get() as i64, metrics::Counter::UploadsRemoved, 1);
                         reply = reply.clone().content(format!("Removed `{name}`."));
                     }
                     Action::View(name) => {

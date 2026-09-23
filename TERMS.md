@@ -46,9 +46,11 @@ source channel may be sent to the configured AI provider to decide whether they
 contain rules and to merge extracted rules. Messages in configured bot channels,
 attachment metadata, and curated rules JSON may be sent to the configured AI
 provider for
-rule review. AI review is advisory and report-only:
-Clause may notify staff and reply with the matched rule explanation, but it does
-not automatically delete messages or punish users. Do not use logs, metrics, or AI outputs
+rule review. AI review is advisory by default: Clause may notify staff and reply
+with the matched rule explanation. If bot managers enable AI auto-delete, Clause
+may delete non-manager messages only when AI reports a high/critical violation
+with at least 90% confidence. Clause does not timeout, ban, or otherwise punish
+users. Do not use logs, metrics, or AI outputs
 for surveillance, harassment, profiling, scraping, advertising, data sales or
 model training.
 
@@ -59,7 +61,7 @@ provide access to the privacy policy and operator contact, and ensure they have
 the necessary authority and legal basis for their configuration. Selecting a
 setting is not consent on behalf of every person whose data may appear in it.
 Use only the data and retention needed for the stated server function. Debug and
-All retention and a configured rule source channel can capture message content
+All retention, AI auto-delete, and a configured rule source channel can process message content
 outside bot-command channels that the bot can access; limit the bot's channel
 access and keep logs restricted to staff
 with a legitimate need to see them. Do not redistribute raw logs to all members.

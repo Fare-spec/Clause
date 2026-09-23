@@ -1,6 +1,7 @@
 mod ai;
 mod files;
 mod logging;
+mod metrics;
 mod public_commands;
 mod retention;
 mod rules;
@@ -85,6 +86,9 @@ fn early_init(database: &str) -> rusqlite::Result<Connection> {
         CREATE TABLE IF NOT EXISTS guild_metrics_settings (
             guild_id INTEGER PRIMARY KEY,
             forwarding_enabled INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS guild_moderation_settings (
+            guild_id INTEGER PRIMARY KEY,
+            auto_delete_enabled INTEGER NOT NULL DEFAULT 0);
         INSERT OR IGNORE INTO guild_manager_roles SELECT guild_id, admin_role_id
             FROM guild_configs WHERE admin_role_id IS NOT NULL;
         INSERT OR IGNORE INTO guild_bot_channels SELECT guild_id, channel_to_manage
@@ -92,6 +96,7 @@ fn early_init(database: &str) -> rusqlite::Result<Connection> {
         UPDATE guild_configs SET admin_role_id = NULL, channel_to_manage = NULL;
         COMMIT;",
     )?;
+    conn.execute_batch(metrics::schema())?;
     let has_level = conn
         .prepare("PRAGMA table_info(guild_configs)")?
         .query_map([], |row| row.get::<_, String>(1))?
@@ -245,6 +250,30 @@ pub(crate) fn set_metrics_forwarding(
     Ok(())
 }
 
+pub(crate) fn auto_delete_enabled(conn: &Connection, guild_id: i64) -> rusqlite::Result<bool> {
+    let mut statement = conn
+        .prepare("SELECT auto_delete_enabled FROM guild_moderation_settings WHERE guild_id = ?1")?;
+    let mut rows = statement.query([guild_id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(false);
+    };
+    Ok(row.get::<_, bool>(0)?)
+}
+
+pub(crate) fn set_auto_delete(
+    conn: &Connection,
+    guild_id: i64,
+    enabled: bool,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO guild_moderation_settings (guild_id, auto_delete_enabled)
+        VALUES (?1, ?2) ON CONFLICT(guild_id) DO UPDATE SET
+        auto_delete_enabled = excluded.auto_delete_enabled",
+        params![guild_id, enabled],
+    )?;
+    Ok(())
+}
+
 // ============================================================
 // DISCORD HANDLER
 // ============================================================
@@ -318,9 +347,10 @@ fn moderation_report(guild: GuildId, message: &Message, review: &ai::MessageRevi
             .join("\n")
     };
     format!(
-        "AI rule review: {}\nSeverity: {}\nAuthor: <@{}> ({})\nChannel: <#{}>\nMessage: {}\nMatched rules: {}\nReason: {}\nQuoted rules:\n{}",
+        "AI rule review: {}\nSeverity: {}\nConfidence: {:.0}%\nAuthor: <@{}> ({})\nChannel: <#{}>\nMessage: {}\nMatched rules: {}\nReason: {}\nQuoted rules:\n{}",
         review.label().to_uppercase(),
         review.severity,
+        review.confidence * 100.0,
         message.author.id.get(),
         message.author.id.get(),
         message.channel_id.get(),
@@ -329,6 +359,14 @@ fn moderation_report(guild: GuildId, message: &Message, review: &ai::MessageRevi
         truncate_utf16(&review.reason, 800),
         quotes
     )
+}
+
+fn should_auto_delete(review: &ai::MessageReview, manager: bool, enabled: bool) -> bool {
+    enabled
+        && !manager
+        && review.status == ai::ReviewStatus::Violation
+        && review.confidence >= 0.90
+        && matches!(review.severity.as_str(), "high" | "critical")
 }
 
 fn moderation_response(review: &ai::MessageReview) -> String {
@@ -355,6 +393,26 @@ struct Handler {
     logger: logging::Logger,
     ai: ai::Ai,
     rules: Arc<Mutex<rules::Cache>>,
+}
+
+impl Handler {
+    pub(crate) fn record_metric(&self, guild: GuildId, counter: metrics::Counter, amount: u64) {
+        if let Ok(db) = self.database.lock() {
+            let _ = metrics::increment(&db, guild.get() as i64, counter, amount);
+        }
+    }
+
+    pub(crate) fn record_ai_tokens(&self, guild: GuildId, usage: ai::TokenUsage) {
+        if let Ok(db) = self.database.lock() {
+            let _ = metrics::add_tokens(
+                &db,
+                guild.get() as i64,
+                usage.input,
+                usage.output,
+                usage.total,
+            );
+        }
+    }
 }
 
 #[async_trait]
@@ -500,18 +558,20 @@ impl EventHandler for Handler {
             return;
         };
 
-        let config = {
+        let (config, auto_delete) = {
             let Ok(database) = self.database.lock() else {
                 return;
             };
-            match get_guild_config(&database, guild.get() as i64) {
+            let config = match get_guild_config(&database, guild.get() as i64) {
                 Ok(Some(config)) if config.setup_completed => config,
                 Ok(_) => return,
                 Err(error) => {
                     eprintln!("Failed to read configuration: {error}");
                     return;
                 }
-            }
+            };
+            let auto_delete = auto_delete_enabled(&database, guild.get() as i64).unwrap_or(false);
+            (config, auto_delete)
         };
         let permissions = message.author_permissions(&ctx).unwrap_or_default();
         let manager_role = message.member.as_ref().is_some_and(|member| {
@@ -600,6 +660,7 @@ Retention: {}",
         let Some(message_text) = message_for_ai(&message) else {
             return;
         };
+        self.record_metric(guild, metrics::Counter::MessagesSeen, 1);
 
         let root = self.storage_root.clone();
         let lock = self.storage_lock.clone();
@@ -623,17 +684,23 @@ Retention: {}",
             return;
         };
         let ai_config = self.guild_ai_config(guild);
+        self.record_metric(guild, metrics::Counter::AiReviews, 1);
         let review = self
             .ai
             .review_message(&rulebook, &message_text, ai_config.as_ref())
             .await;
         let review = match review {
-            Ok(review) if review.needs_action() => review,
-            Ok(_)
-            | Err(crate::ai::SummaryError::MissingConfig | crate::ai::SummaryError::NoRuleFiles) => {
+            Ok(review) if review.value.needs_action() => review,
+            Ok(review) => {
+                self.record_ai_tokens(guild, review.usage);
+                self.record_metric(guild, metrics::Counter::AiCompliant, 1);
+                return;
+            }
+            Err(crate::ai::SummaryError::MissingConfig | crate::ai::SummaryError::NoRuleFiles) => {
                 return;
             }
             Err(error) => {
+                self.record_metric(guild, metrics::Counter::AiErrors, 1);
                 let level = match error {
                     crate::ai::SummaryError::BadResponse
                     | crate::ai::SummaryError::ProviderRequest(_)
@@ -666,6 +733,20 @@ Retention: {}",
             .filter_map(|id| u64::try_from(*id).ok())
             .map(RoleId::new)
             .collect::<Vec<_>>();
+        let review_usage = review.usage;
+        let review = review.value;
+        self.record_ai_tokens(guild, review_usage);
+        match review.status {
+            ai::ReviewStatus::GrayArea => {
+                self.record_metric(guild, metrics::Counter::AiGrayArea, 1)
+            }
+            ai::ReviewStatus::Violation => {
+                self.record_metric(guild, metrics::Counter::AiViolations, 1)
+            }
+            ai::ReviewStatus::Compliant => {
+                self.record_metric(guild, metrics::Counter::AiCompliant, 1)
+            }
+        }
         let report = moderation_report(guild, &message, &review);
         self.logger.managed_message_with_mentions(
             &ctx,
@@ -674,6 +755,39 @@ Retention: {}",
             logging::Level::Warn,
             mention_roles,
         );
+        self.record_metric(guild, metrics::Counter::StaffReviewPings, 1);
+
+        if should_auto_delete(&review, manager, auto_delete) {
+            match message.delete(&ctx.http).await {
+                Ok(()) => {
+                    self.record_metric(guild, metrics::Counter::AiDeletedMessages, 1);
+                    self.logger.log(
+                        &ctx,
+                        guild,
+                        logging::Level::Warn,
+                        format!(
+                            "Deleted AI-flagged message {} in channel {} with confidence {:.0}%.",
+                            message.id,
+                            message.channel_id,
+                            review.confidence * 100.0
+                        ),
+                    );
+                    return;
+                }
+                Err(_) => {
+                    self.record_metric(guild, metrics::Counter::AiDeleteFailures, 1);
+                    self.logger.log(
+                        &ctx,
+                        guild,
+                        logging::Level::Error,
+                        format!(
+                            "Could not delete AI-flagged message {} in channel {}.",
+                            message.id, message.channel_id
+                        ),
+                    );
+                }
+            }
+        }
 
         let response = moderation_response(&review);
         let send_result = message
@@ -692,6 +806,9 @@ Retention: {}",
                     ),
             )
             .await;
+        if send_result.is_ok() {
+            self.record_metric(guild, metrics::Counter::BotReplies, 1);
+        }
         if send_result.is_err() {
             self.logger.log(
                 &ctx,
@@ -712,6 +829,7 @@ impl Handler {
         if content.is_empty() {
             return;
         }
+        self.record_metric(guild, metrics::Counter::RuleSourceMessages, 1);
         let ai_config = self.guild_ai_config(guild);
         let public = {
             let root = self.storage_root.clone();
@@ -742,6 +860,7 @@ impl Handler {
             Ok(book) => book,
             Err(crate::ai::SummaryError::NoRuleFiles) => return,
             Err(error) => {
+                self.record_metric(guild, metrics::Counter::AiErrors, 1);
                 let detail = match &error {
                     crate::ai::SummaryError::ProviderRequest(diagnostic)
                     | crate::ai::SummaryError::ProviderResponse(diagnostic) => {
@@ -761,6 +880,9 @@ impl Handler {
                 return;
             }
         };
+        let generated_usage = generated.usage;
+        let generated = generated.value;
+        self.record_ai_tokens(guild, generated_usage);
         let generated_count = generated.rules.len();
         let saved = {
             let root = self.storage_root.clone();
@@ -799,6 +921,7 @@ impl Handler {
                         message.id, message.author.id, count
                     ),
                 );
+                self.record_metric(guild, metrics::Counter::RulesImported, count as u64);
                 let _ = message
                     .channel_id
                     .send_message(

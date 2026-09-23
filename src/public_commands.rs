@@ -1,7 +1,7 @@
 use crate::{
-    GuildAiConfig, GuildConfig, Handler, delete_ai_config, get_ai_config, get_guild_config,
-    logging::Level, metrics_forwarding_enabled, retention, rules, save_ai_config,
-    set_metrics_forwarding, storage,
+    GuildAiConfig, GuildConfig, Handler, auto_delete_enabled, delete_ai_config, get_ai_config,
+    get_guild_config, logging::Level, metrics, metrics_forwarding_enabled, retention, rules,
+    save_ai_config, set_auto_delete, set_metrics_forwarding, storage,
 };
 use serenity::all::*;
 
@@ -251,6 +251,21 @@ fn ai_command() -> CreateCommand {
             "test",
             "Send a small health-check request to this server's AI provider",
         ))
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "auto-delete",
+                "Enable or disable high-confidence AI message deletion",
+            )
+            .add_sub_option(
+                CreateCommandOption::new(
+                    CommandOptionType::Boolean,
+                    "enabled",
+                    "Whether high-confidence high/critical violations may be deleted",
+                )
+                .required(true),
+            ),
+        )
 }
 
 fn bytes(value: u64) -> String {
@@ -284,10 +299,38 @@ struct MetricsSnapshot {
     rules_public: bool,
     has_guild_ai_config: bool,
     forwarding_enabled: bool,
+    auto_delete_enabled: bool,
+    today: metrics::Totals,
+    seven_days: metrics::Totals,
+    all_time: metrics::Totals,
 }
 
 fn yes_no(value: bool) -> &'static str {
     if value { "enabled" } else { "disabled" }
+}
+
+fn metrics_line(totals: &metrics::Totals) -> String {
+    format!(
+        "Messages: {} · AI reviews: {} · ok/gray/violations: {}/{}/{} · AI errors: {} · deleted: {} · delete failures: {} · staff pings: {} · replies: {} · rule-source msgs: {} · rules imported: {} · commands: {} · uploads +/−: {}/{} · tokens in/out/total: {}/{}/{}",
+        totals.messages_seen,
+        totals.ai_reviews,
+        totals.ai_compliant,
+        totals.ai_gray_area,
+        totals.ai_violations,
+        totals.ai_errors,
+        totals.ai_deleted_messages,
+        totals.ai_delete_failures,
+        totals.staff_review_pings,
+        totals.bot_replies,
+        totals.rule_source_messages,
+        totals.rules_imported,
+        totals.commands_used,
+        totals.uploads_added,
+        totals.uploads_removed,
+        totals.input_tokens,
+        totals.output_tokens,
+        totals.total_tokens,
+    )
 }
 
 fn metrics_embed(snapshot: &MetricsSnapshot) -> CreateEmbed {
@@ -319,6 +362,10 @@ fn metrics_embed(snapshot: &MetricsSnapshot) -> CreateEmbed {
         )
         .field("AI review channels", snapshot.config.channel_ids.len().to_string(), true)
         .field("Manager roles", snapshot.config.admin_role_ids.len().to_string(), true)
+        .field("AI auto-delete", yes_no(snapshot.auto_delete_enabled), true)
+        .field("Today", metrics_line(&snapshot.today), false)
+        .field("Last 7 days", metrics_line(&snapshot.seven_days), false)
+        .field("All time", metrics_line(&snapshot.all_time), false)
         .field(
             "Metrics forwarding allowed",
             yes_no(snapshot.forwarding_enabled),
@@ -371,6 +418,7 @@ fn settings_embed(
     usage: Option<&storage::Usage>,
     has_guild_ai_config: bool,
     forwarding_enabled: bool,
+    auto_delete_enabled: bool,
 ) -> CreateEmbed {
     let log_channel = config
         .log_channel_id
@@ -414,6 +462,7 @@ fn settings_embed(
             ai_review_visibility(has_guild_ai_config),
             false,
         )
+        .field("AI auto-delete", yes_no(auto_delete_enabled), true)
         .field(
             "Metrics forwarding allowed",
             yes_no(forwarding_enabled),
@@ -491,6 +540,7 @@ fn disable_guild_settings(db: &rusqlite::Connection, guild: i64) -> rusqlite::Re
         )?;
         delete_ai_config(db, guild)?;
         set_metrics_forwarding(db, guild, false)?;
+        set_auto_delete(db, guild, false)?;
         Ok(())
     })();
     if result.is_err() {
@@ -514,6 +564,14 @@ fn delete_guild_settings(db: &rusqlite::Connection, guild: i64) -> rusqlite::Res
         delete_ai_config(db, guild)?;
         db.execute(
             "DELETE FROM guild_metrics_settings WHERE guild_id = ?1",
+            [guild],
+        )?;
+        db.execute(
+            "DELETE FROM guild_moderation_settings WHERE guild_id = ?1",
+            [guild],
+        )?;
+        db.execute(
+            "DELETE FROM guild_metrics_daily WHERE guild_id = ?1",
             [guild],
         )?;
         db.execute("DELETE FROM guild_configs WHERE guild_id = ?1", [guild])?;
@@ -930,13 +988,16 @@ impl Handler {
                 .await;
             let (message, level) = match loaded {
                 Ok(Ok(ai_config)) => match self.ai.test_provider(ai_config.as_ref()).await {
-                    Ok(reply) => (
-                        format!(
-                            "AI test succeeded. Provider replied: `{}`",
-                            reply.chars().take(500).collect::<String>()
-                        ),
-                        Level::Info,
-                    ),
+                    Ok(reply) => {
+                        self.record_ai_tokens(guild, reply.usage);
+                        (
+                            format!(
+                                "AI test succeeded. Provider replied: `{}`",
+                                reply.value.chars().take(500).collect::<String>()
+                            ),
+                            Level::Info,
+                        )
+                    }
                     Err(error) => {
                         let (public, level) = summary_error(&error);
                         (
@@ -972,6 +1033,7 @@ impl Handler {
         let endpoint = string_arg(options, "endpoint");
         let model = string_arg(options, "model");
         let api_key = string_arg(options, "api_key");
+        let enabled = bool_arg(options, "enabled");
         let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
             let db = database.lock().map_err(|_| "Settings are unavailable.".to_owned())?;
             let config = get_guild_config(&db, guild.get() as i64)
@@ -1023,7 +1085,16 @@ impl Handler {
                         .map_err(|_| "Could not clear AI settings.".to_owned())?;
                     Ok("Server AI provider override cleared. Clause will use environment AI settings.".into())
                 }
-                _ => Err("Choose show, set, clear, or test.".into()),
+                "auto-delete" => {
+                    let enabled = enabled.ok_or_else(|| "Choose whether auto-delete is enabled.".to_owned())?;
+                    set_auto_delete(&db, guild.get() as i64, enabled)
+                        .map_err(|_| "Could not save auto-delete setting.".to_owned())?;
+                    Ok(format!(
+                        "AI auto-delete is now {}. Only non-manager high/critical violations with at least 90% AI confidence may be deleted.",
+                        yes_no(enabled)
+                    ))
+                }
+                _ => Err("Choose show, set, clear, test, or auto-delete.".into()),
             }
         })
         .await;
@@ -1058,6 +1129,9 @@ impl Handler {
     }
 
     pub(crate) async fn public_command(&self, ctx: &Context, command: &CommandInteraction) {
+        if let Some(guild) = command.guild_id {
+            self.record_metric(guild, metrics::Counter::CommandsUsed, 1);
+        }
         if command.data.name == "storage" {
             self.storage_command(ctx, command).await;
             return;
@@ -1218,6 +1292,14 @@ impl Handler {
             }
             let forwarding_enabled = metrics_forwarding_enabled(&db, guild.get() as i64)
                 .map_err(|_| "Could not load metrics settings.".to_owned())?;
+            let auto_delete_enabled = auto_delete_enabled(&db, guild.get() as i64)
+                .map_err(|_| "Could not load moderation settings.".to_owned())?;
+            let today = metrics::today_totals(&db, guild.get() as i64)
+                .map_err(|_| "Could not load metrics totals.".to_owned())?;
+            let seven_days = metrics::seven_day_totals(&db, guild.get() as i64)
+                .map_err(|_| "Could not load metrics totals.".to_owned())?;
+            let all_time = metrics::all_time_totals(&db, guild.get() as i64)
+                .map_err(|_| "Could not load metrics totals.".to_owned())?;
             let has_guild_ai_config = get_ai_config(&db, guild.get() as i64)
                 .map_err(|_| "Could not load AI settings.".to_owned())?
                 .is_some();
@@ -1248,6 +1330,10 @@ impl Handler {
                 rules_public: rulebook.public,
                 has_guild_ai_config,
                 forwarding_enabled,
+                auto_delete_enabled,
+                today,
+                seven_days,
+                all_time,
             })
         })
         .await;
@@ -1372,7 +1458,7 @@ impl Handler {
         let lock = self.storage_lock.clone();
         let root = self.storage_root.clone();
         let result = tokio::task::spawn_blocking(
-            move || -> Result<(GuildConfig, Option<storage::Usage>, bool, bool), &'static str> {
+            move || -> Result<(GuildConfig, Option<storage::Usage>, bool, bool, bool), &'static str> {
                 let db = database.lock().map_err(|_| "Settings are unavailable.")?;
                 let config = get_guild_config(&db, guild.get() as i64)
                     .map_err(|_| "Could not load settings.")?
@@ -1383,23 +1469,26 @@ impl Handler {
                     .is_some();
                 let forwarding_enabled = metrics_forwarding_enabled(&db, guild.get() as i64)
                     .map_err(|_| "Could not load metrics settings.")?;
+                let auto_delete = auto_delete_enabled(&db, guild.get() as i64)
+                    .map_err(|_| "Could not load moderation settings.")?;
                 let usage = lock.lock().ok().and_then(|_guard| {
                     let _ =
                         retention::prune(&root, guild.get(), config.retention, retention::now());
                     storage::stats(&root, guild.get()).ok()
                 });
-                Ok((config, usage, has_ai_config, forwarding_enabled))
+                Ok((config, usage, has_ai_config, forwarding_enabled, auto_delete))
             },
         )
         .await;
 
         let (response, level) = match result {
-            Ok(Ok((config, usage, has_ai_config, forwarding_enabled))) => (
+            Ok(Ok((config, usage, has_ai_config, forwarding_enabled, auto_delete))) => (
                 EditInteractionResponse::new().embed(settings_embed(
                     &config,
                     usage.as_ref(),
                     has_ai_config,
                     forwarding_enabled,
+                    auto_delete,
                 )),
                 Level::Info,
             ),
@@ -1493,17 +1582,18 @@ impl Handler {
 
         let (response, level, detail) = match result {
             Ok(summary) => {
+                self.record_ai_tokens(guild, summary.usage);
                 let mut response = EditInteractionResponse::new().content(
                     "AI-generated rule summary from the current curated rules JSON. Review before relying on it.",
                 );
                 response = response.new_attachment(CreateAttachment::bytes(
-                    summary.clone().into_bytes(),
+                    summary.value.clone().into_bytes(),
                     "rule-summary.md",
                 ));
                 (
                     response,
                     Level::Info,
-                    format!("summary generated ({} bytes)", summary.len()),
+                    format!("summary generated ({} bytes)", summary.value.len()),
                 )
             }
             Err(error) => {
@@ -1796,8 +1886,12 @@ impl Handler {
             .generate_rulebook(&files, public, ai_config.as_ref())
             .await;
         let book = match generated {
-            Ok(book) => book,
+            Ok(book) => {
+                self.record_ai_tokens(guild, book.usage);
+                book.value
+            }
             Err(error) => {
+                self.record_metric(guild, metrics::Counter::AiErrors, 1);
                 let detail = ai_error_detail(&error);
                 let (message, level) = summary_error(&error);
                 self.logger.log(
@@ -1827,13 +1921,10 @@ impl Handler {
 
         match saved {
             Ok(Ok(())) => {
-                self.finish_rules_response(
-                    ctx,
-                    command,
-                    guild,
-                    Level::Info,
-                    format!("Generated {count} curated rule(s) from uploaded files."),
-                )
+                self.finish_rules_response(ctx, command, guild, Level::Info, {
+                    self.record_metric(guild, metrics::Counter::RulesImported, count as u64);
+                    format!("Generated {count} curated rule(s) from uploaded files.")
+                })
                 .await;
             }
             Ok(Err(error)) => {
@@ -1997,8 +2088,12 @@ impl Handler {
             .generate_rulebook_from_messages(&messages, public, ai_config.as_ref())
             .await;
         let book = match generated {
-            Ok(book) => book,
+            Ok(book) => {
+                self.record_ai_tokens(guild, book.usage);
+                book.value
+            }
             Err(error) => {
+                self.record_metric(guild, metrics::Counter::AiErrors, 1);
                 let detail = ai_error_detail(&error);
                 let (message, level) = summary_error(&error);
                 self.logger.log(
@@ -2027,6 +2122,7 @@ impl Handler {
         .await;
         match saved {
             Ok(Ok(())) => {
+                self.record_metric(guild, metrics::Counter::RulesImported, count as u64);
                 self.finish_rules_response(
                     ctx,
                     command,
@@ -2367,6 +2463,19 @@ mod tests {
                 .iter()
                 .any(|option| option["name"] == "test")
         );
+        let auto_delete = ai_value["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|option| option["name"] == "auto-delete")
+            .unwrap();
+        assert!(
+            auto_delete["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|option| option["name"] == "enabled" && option["required"] == true)
+        );
         let set = ai_value["options"]
             .as_array()
             .unwrap()
@@ -2416,11 +2525,27 @@ mod tests {
             CREATE TABLE guild_metrics_settings (
                 guild_id INTEGER PRIMARY KEY,
                 forwarding_enabled INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE guild_moderation_settings (
+                guild_id INTEGER PRIMARY KEY,
+                auto_delete_enabled INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE guild_metrics_daily (
+                guild_id INTEGER NOT NULL, day INTEGER NOT NULL,
+                messages_seen INTEGER NOT NULL DEFAULT 0, ai_reviews INTEGER NOT NULL DEFAULT 0,
+                ai_compliant INTEGER NOT NULL DEFAULT 0, ai_gray_area INTEGER NOT NULL DEFAULT 0,
+                ai_violations INTEGER NOT NULL DEFAULT 0, ai_errors INTEGER NOT NULL DEFAULT 0,
+                ai_deleted_messages INTEGER NOT NULL DEFAULT 0, ai_delete_failures INTEGER NOT NULL DEFAULT 0,
+                staff_review_pings INTEGER NOT NULL DEFAULT 0, bot_replies INTEGER NOT NULL DEFAULT 0,
+                rule_source_messages INTEGER NOT NULL DEFAULT 0, rules_imported INTEGER NOT NULL DEFAULT 0,
+                commands_used INTEGER NOT NULL DEFAULT 0, uploads_added INTEGER NOT NULL DEFAULT 0,
+                uploads_removed INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, day));
             INSERT INTO guild_configs VALUES (1, 1, 10, 11, 'debug', 'all:7');
             INSERT INTO guild_manager_roles VALUES (1, 20);
             INSERT INTO guild_bot_channels VALUES (1, 30);
             INSERT INTO guild_ai_configs VALUES (1, 'https://example.test/v1/chat/completions', 'secret', 'model');
-            INSERT INTO guild_metrics_settings VALUES (1, 1);",
+            INSERT INTO guild_metrics_settings VALUES (1, 1);
+            INSERT INTO guild_moderation_settings VALUES (1, 1);",
         )
         .unwrap();
 
@@ -2462,6 +2587,21 @@ mod tests {
             CREATE TABLE guild_metrics_settings (
                 guild_id INTEGER PRIMARY KEY,
                 forwarding_enabled INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE guild_moderation_settings (
+                guild_id INTEGER PRIMARY KEY,
+                auto_delete_enabled INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE guild_metrics_daily (
+                guild_id INTEGER NOT NULL, day INTEGER NOT NULL,
+                messages_seen INTEGER NOT NULL DEFAULT 0, ai_reviews INTEGER NOT NULL DEFAULT 0,
+                ai_compliant INTEGER NOT NULL DEFAULT 0, ai_gray_area INTEGER NOT NULL DEFAULT 0,
+                ai_violations INTEGER NOT NULL DEFAULT 0, ai_errors INTEGER NOT NULL DEFAULT 0,
+                ai_deleted_messages INTEGER NOT NULL DEFAULT 0, ai_delete_failures INTEGER NOT NULL DEFAULT 0,
+                staff_review_pings INTEGER NOT NULL DEFAULT 0, bot_replies INTEGER NOT NULL DEFAULT 0,
+                rule_source_messages INTEGER NOT NULL DEFAULT 0, rules_imported INTEGER NOT NULL DEFAULT 0,
+                commands_used INTEGER NOT NULL DEFAULT 0, uploads_added INTEGER NOT NULL DEFAULT 0,
+                uploads_removed INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, day));
             INSERT INTO guild_configs VALUES (1, 1, 10, 11, 'debug', 'all:7');
             INSERT INTO guild_configs VALUES (2, 1, 20, 21, 'info', 'none');
             INSERT INTO guild_manager_roles VALUES (1, 20);
@@ -2470,7 +2610,9 @@ mod tests {
             INSERT INTO guild_bot_channels VALUES (2, 50);
             INSERT INTO guild_ai_configs VALUES (1, 'https://example.test/v1/chat/completions', 'secret', 'model');
             INSERT INTO guild_metrics_settings VALUES (1, 1);
-            INSERT INTO guild_metrics_settings VALUES (2, 1);",
+            INSERT INTO guild_moderation_settings VALUES (1, 1);
+            INSERT INTO guild_metrics_settings VALUES (2, 1);
+            INSERT INTO guild_moderation_settings VALUES (2, 1);",
         )
         .unwrap();
 
@@ -2509,6 +2651,27 @@ mod tests {
             rules_public: true,
             has_guild_ai_config: false,
             forwarding_enabled: false,
+            auto_delete_enabled: false,
+            today: metrics::Totals {
+                messages_seen: 3,
+                ai_reviews: 2,
+                ai_violations: 1,
+                total_tokens: 42,
+                ..Default::default()
+            },
+            seven_days: metrics::Totals {
+                messages_seen: 5,
+                ai_reviews: 3,
+                ai_gray_area: 1,
+                ..Default::default()
+            },
+            all_time: metrics::Totals {
+                messages_seen: 8,
+                ai_deleted_messages: 1,
+                uploads_added: 2,
+                uploads_removed: 1,
+                ..Default::default()
+            },
         };
         let value = serde_json::to_value(metrics_embed(&snapshot)).unwrap();
         let fields = value["fields"].as_array().unwrap();
@@ -2550,7 +2713,7 @@ mod tests {
             total: 14,
         };
         let value =
-            serde_json::to_value(settings_embed(&config, Some(&usage), true, true)).unwrap();
+            serde_json::to_value(settings_embed(&config, Some(&usage), true, true, true)).unwrap();
         let fields = value["fields"].as_array().unwrap();
         assert!(fields.iter().any(|field| field["name"] == "Local retention"
             && field["value"].as_str().unwrap().contains("All messages")));

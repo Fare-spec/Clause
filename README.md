@@ -275,8 +275,11 @@ an advisory explanation and matching rule IDs.
 
 If the AI says the message is a gray area, Clause uses the same report and ping
 flow but the channel reply says staff were asked to review it because the bot is
-unsure. Clause does not delete messages, timeout users, ban users, or apply any
-automatic punishment. Managers decide what to do.
+unsure. By default Clause does not delete messages, timeout users, ban users, or
+apply punishment. Bot managers can enable `/ai auto-delete enabled:true`; then
+only non-manager messages that the AI marks as high/critical violations with at
+least 90% confidence are deleted. Managers decide what to do for all other
+reports.
 
 The AI request contains the current message content, attachment metadata
 (filename, type, size), and the curated rules JSON. It does not download ordinary
@@ -295,9 +298,10 @@ channel imports, rule-source messages, and message review in that server.
   can request the aggregate; no file names or log contents are exposed.
 - `/metrics show`: private manager-only response with aggregate local metrics:
   storage usage, upload count, retained log size, curated rule count, AI provider
-  source, configured review channel count, manager-role count, and whether metrics
-  forwarding is allowed. It does not include message text, filenames, rule text,
-  usernames, or API keys.
+  source, configured review channel count, manager-role count, AI moderation
+  counters, upload/remove counts, approximate or provider-reported AI token
+  counts, and whether metrics forwarding is allowed. It does not include message
+  text, filenames, rule text, usernames, or API keys.
 - `/metrics forwarding enabled`: manager-only toggle for whether this server allows
   future aggregate metrics forwarding to an operator/main server. The current
   build stores and displays the preference but does not implement an external
@@ -338,6 +342,8 @@ channel imports, rule-source messages, and message review in that server.
   environment AI settings.
 - `/ai test`: manager-only health check that sends one small prompt to the active
   AI provider and returns the provider reply or redacted diagnostic details.
+- `/ai auto-delete enabled`: manager-only toggle for deleting non-manager messages
+  only when AI reports a high/critical violation with at least 90% confidence.
 - `/logs clear confirm:false`: private manager-only preview of retained local log
   usage.
 - `/logs clear confirm:true`: private manager-only deletion of Clause-owned local

@@ -32,7 +32,7 @@ where the bot has access. Clause does not fetch historical messages in bulk.
 A manager's `/files upload` downloads the selected attachment and stores its bytes
 and filename in that server's upload folder. Ordinary message attachments are not
 automatically downloaded for retention. The bot does not execute uploaded files.
-`/storage` shows aggregate usage, not filenames or message content. `/metrics show` is manager-only and shows aggregate local counts and sizes, such as upload count, retained log size, rule count, AI provider source, and whether metrics forwarding is allowed. It does not show message text, filenames, rule text, usernames, or API keys.
+`/storage` shows aggregate usage, not filenames or message content. `/metrics show` is manager-only and shows aggregate local counts and sizes, such as upload count, retained log size, rule count, AI provider source, AI review outcomes, delete counts, command counts, upload/remove counts, token counts, and whether metrics forwarding is allowed. It does not show message text, filenames, rule text, usernames, or API keys.
 
 When AI is configured, `/ai test` sends one small diagnostic prompt to the active provider. `/summary` sends the curated rules JSON from this server's
 `rules/rules.json` file to the configured AI endpoint to generate a rule summary.
@@ -49,8 +49,10 @@ configured bot channels, plus attachment
 metadata and the curated rules JSON, to the configured AI endpoint for
 report-only rule review. Compliant messages produce no public
 response. Clear violations and gray-area results are posted to the configured log
-channel, ping bot-manager roles, and receive an advisory in-channel bot reply.
-Clause does not automatically delete messages or punish users. The endpoint, model, account, and retention practices depend on the operator's AI
+channel and ping bot-manager roles. By default they also receive an advisory
+in-channel bot reply. If bot managers enable AI auto-delete, Clause may delete
+non-manager messages only when the AI returns a high/critical violation with at
+least 90% confidence. Clause does not timeout, ban, or otherwise punish users. The endpoint, model, account, and retention practices depend on the operator's AI
 provider configuration. A bot manager can store a server-specific AI endpoint,
 model, and API key with `/ai set`; the key is stored in SQLite, hidden from bot
 responses, and redacted from Clause debug logs when known as `api_key`, `key`, or
@@ -60,7 +62,7 @@ rule-source channels, or bot-channel messages.
 ## Storage and retention
 
 Server configuration is stored in SQLite, including role/channel IDs, the optional
-rule source channel ID, log level, retention policy, the metrics forwarding preference, and any server-specific AI
+rule source channel ID, log level, retention policy, AI auto-delete setting, the metrics forwarding preference, and any server-specific AI
 provider override. Each server has a separate directory containing protected
 quota metadata, an `uploads/` folder, and a `logs/` folder. Uploads, local retained
 logs, and metadata share a configurable per-guild limit, defaulting to 10 Mo (10,000,000 bytes). SQLite configuration and

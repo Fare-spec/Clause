@@ -85,6 +85,24 @@ impl fmt::Display for AiDiagnostic {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TokenUsage {
+    pub input: u64,
+    pub output: u64,
+    pub total: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AiResponse<T> {
+    pub value: T,
+    pub usage: TokenUsage,
+}
+
+struct ChatOutput {
+    content: String,
+    usage: TokenUsage,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReviewStatus {
     Compliant,
@@ -98,9 +116,10 @@ pub(crate) struct RuleQuote {
     pub text: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct MessageReview {
     pub status: ReviewStatus,
+    pub confidence: f32,
     pub severity: String,
     pub rule_ids: Vec<String>,
     pub reason: String,
@@ -196,8 +215,9 @@ fn review_prompt(rulebook_json: &str, message: &str) -> Result<String, SummaryEr
     Ok(format!(
         "Review this Discord message against every rule in the curated rules JSON. \
          Return only JSON matching this schema: \
-         {{\"status\":\"compliant|gray_area|violation\",\"severity\":\"low|medium|high|critical\",\"rule_ids\":[\"matching-rule-id\"],\"reason\":\"short reason\",\"quoted_rules\":[{{\"id\":\"matching-rule-id\",\"text\":\"exact relevant rule text\"}}]}}. \
+         {{\"status\":\"compliant|gray_area|violation\",\"confidence\":0.0,\"severity\":\"low|medium|high|critical\",\"rule_ids\":[\"matching-rule-id\"],\"reason\":\"short reason\",\"quoted_rules\":[{{\"id\":\"matching-rule-id\",\"text\":\"exact relevant rule text\"}}]}}. \
          Use gray_area when the message may violate a rule but context is missing or uncertain. \
+         Use confidence to indicate certainty from 0.0 to 1.0. \
          Use violation only when the message clearly breaks one or more rules. \
          Quote only rules from the provided JSON; do not invent rules.\n\nRULES JSON:\n{rulebook_json}\n\nMESSAGE:\n{message}"
     ))
@@ -331,17 +351,21 @@ impl Ai {
         &self,
         rulebook_json: &str,
         guild_config: Option<&GuildAiConfig>,
-    ) -> Result<String, SummaryError> {
+    ) -> Result<AiResponse<String>, SummaryError> {
         let config = self.config_for(guild_config)?;
         let prompt = rulebook_prompt(rulebook_json)?;
-        self.chat(
+        let response = self.chat(
             &config,
             "summary",
             "You summarize Discord server rules exactly from the provided JSON. Do not invent rules.",
             &prompt,
             config.summary_max_tokens,
         )
-        .await
+        .await?;
+        Ok(AiResponse {
+            value: response.content,
+            usage: response.usage,
+        })
     }
 
     pub(crate) async fn generate_rulebook(
@@ -349,7 +373,7 @@ impl Ai {
         files: &[(String, Vec<u8>)],
         public: bool,
         guild_config: Option<&GuildAiConfig>,
-    ) -> Result<rules::RuleBook, SummaryError> {
+    ) -> Result<AiResponse<rules::RuleBook>, SummaryError> {
         let config = self.config_for(guild_config)?;
         let prompt = uploaded_rules_prompt(files)?;
         let response = self
@@ -361,7 +385,11 @@ impl Ai {
                 config.generation_max_tokens,
             )
             .await?;
-        parse_generated_rulebook(&response, public)
+        let book = parse_generated_rulebook(&response.content, public)?;
+        Ok(AiResponse {
+            value: book,
+            usage: response.usage,
+        })
     }
 
     pub(crate) async fn generate_rulebook_from_messages(
@@ -369,7 +397,7 @@ impl Ai {
         messages: &[(String, String)],
         public: bool,
         guild_config: Option<&GuildAiConfig>,
-    ) -> Result<rules::RuleBook, SummaryError> {
+    ) -> Result<AiResponse<rules::RuleBook>, SummaryError> {
         let config = self.config_for(guild_config)?;
         let prompt = channel_rules_prompt(messages)?;
         let response = self
@@ -381,7 +409,11 @@ impl Ai {
                 config.generation_max_tokens,
             )
             .await?;
-        parse_generated_rulebook(&response, public)
+        let book = parse_generated_rulebook(&response.content, public)?;
+        Ok(AiResponse {
+            value: book,
+            usage: response.usage,
+        })
     }
 
     pub(crate) async fn review_message(
@@ -389,7 +421,7 @@ impl Ai {
         rulebook_json: &str,
         message: &str,
         guild_config: Option<&GuildAiConfig>,
-    ) -> Result<MessageReview, SummaryError> {
+    ) -> Result<AiResponse<MessageReview>, SummaryError> {
         let config = self.config_for(guild_config)?;
         let prompt = review_prompt(rulebook_json, message)?;
         let response = self
@@ -401,22 +433,31 @@ impl Ai {
                 config.review_max_tokens,
             )
             .await?;
-        parse_message_review(&response)
+        let review = parse_message_review(&response.content)?;
+        Ok(AiResponse {
+            value: review,
+            usage: response.usage,
+        })
     }
 
     pub(crate) async fn test_provider(
         &self,
         guild_config: Option<&GuildAiConfig>,
-    ) -> Result<String, SummaryError> {
+    ) -> Result<AiResponse<String>, SummaryError> {
         let config = self.config_for(guild_config)?;
-        self.chat(
-            &config,
-            "diagnostic",
-            "You are a health check for a Discord moderation bot. Reply briefly.",
-            "Reply with exactly: Clause AI test OK",
-            32,
-        )
-        .await
+        let response = self
+            .chat(
+                &config,
+                "diagnostic",
+                "You are a health check for a Discord moderation bot. Reply briefly.",
+                "Reply with exactly: Clause AI test OK",
+                32,
+            )
+            .await?;
+        Ok(AiResponse {
+            value: response.content,
+            usage: response.usage,
+        })
     }
 
     async fn chat(
@@ -426,7 +467,7 @@ impl Ai {
         system: &str,
         prompt: &str,
         max_tokens: u64,
-    ) -> Result<String, SummaryError> {
+    ) -> Result<ChatOutput, SummaryError> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         let auth = HeaderValue::from_str(&format!("Bearer {}", config.key))
@@ -499,7 +540,7 @@ impl Ai {
                 format!("{error}; body: {}", redacted_body_preview(&response_text)),
             ))
         })?;
-        value["choices"][0]["message"]["content"]
+        let content = value["choices"][0]["message"]["content"]
             .as_str()
             .or_else(|| value["output_text"].as_str())
             .map(str::trim)
@@ -513,8 +554,33 @@ impl Ai {
                     "empty-content",
                     redacted_body_preview(&response_text),
                 ))
-            })
+            })?;
+        let usage = token_usage(&value, system, prompt, &content);
+        Ok(ChatOutput { content, usage })
     }
+}
+
+fn token_usage(value: &serde_json::Value, system: &str, prompt: &str, content: &str) -> TokenUsage {
+    let input = value["usage"]["prompt_tokens"]
+        .as_u64()
+        .or_else(|| value["usage"]["input_tokens"].as_u64())
+        .unwrap_or_else(|| estimate_tokens(system) + estimate_tokens(prompt));
+    let output = value["usage"]["completion_tokens"]
+        .as_u64()
+        .or_else(|| value["usage"]["output_tokens"].as_u64())
+        .unwrap_or_else(|| estimate_tokens(content));
+    let total = value["usage"]["total_tokens"]
+        .as_u64()
+        .unwrap_or_else(|| input.saturating_add(output));
+    TokenUsage {
+        input,
+        output,
+        total,
+    }
+}
+
+fn estimate_tokens(text: &str) -> u64 {
+    ((text.chars().count() as u64).saturating_add(3) / 4).max(1)
 }
 
 fn json_slice(text: &str) -> Option<&str> {
@@ -530,6 +596,8 @@ fn json_slice(text: &str) -> Option<&str> {
 #[derive(Deserialize)]
 struct ProviderReview {
     status: String,
+    #[serde(default)]
+    confidence: Option<f32>,
     #[serde(default = "default_low")]
     severity: String,
     #[serde(default)]
@@ -560,6 +628,16 @@ pub(crate) fn parse_message_review(text: &str) -> Result<MessageReview, SummaryE
         "violation" | "violates" | "blocked" => ReviewStatus::Violation,
         _ => return Err(SummaryError::BadResponse),
     };
+    let confidence = review
+        .confidence
+        .unwrap_or(if status == ReviewStatus::Compliant {
+            1.0
+        } else {
+            0.0
+        });
+    if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
+        return Err(SummaryError::BadResponse);
+    }
     let severity = review.severity.trim().to_ascii_lowercase();
     rules::validate_severity(&severity).map_err(|_| SummaryError::BadResponse)?;
     let mut rule_ids = Vec::new();
@@ -587,6 +665,7 @@ pub(crate) fn parse_message_review(text: &str) -> Result<MessageReview, SummaryE
     }
     Ok(MessageReview {
         status,
+        confidence,
         severity,
         rule_ids,
         reason,
