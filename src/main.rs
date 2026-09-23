@@ -414,7 +414,9 @@ impl EventHandler for Handler {
                 if matches!(
                     command.data.name.as_str(),
                     "storage"
+                        | "metrics"
                         | "disable"
+                        | "leave"
                         | "settings"
                         | "summary"
                         | "rules"
