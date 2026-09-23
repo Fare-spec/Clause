@@ -287,12 +287,24 @@ channel imports, rule-source messages, and message review in that server.
 ## Storage status and privacy information
 
 - `/disable`: administrator/Manage Server command that disables Clause for the server until `/setup` is run again. It clears configured roles/channels, the server AI override, and retained local logs, while leaving uploads and curated rules on disk.
+- `/leave confirm delete_data`: server-owner command that makes Clause leave the
+  server. With `delete_data:true`, Clause first deletes this guild's SQLite
+  settings, AI override, retained logs, uploads, rules, and guild storage folder.
 - `/storage`: private response with available/used bytes and an uploads, retained
   logs, and metadata/other breakdown after retention cleanup. Any server member
   can request the aggregate; no file names or log contents are exposed.
+- `/metrics show`: private manager-only response with aggregate local metrics:
+  storage usage, upload count, retained log size, curated rule count, AI provider
+  source, configured review channel count, manager-role count, and whether metrics
+  forwarding is allowed. It does not include message text, filenames, rule text,
+  usernames, or API keys.
+- `/metrics forwarding enabled`: manager-only toggle for whether this server allows
+  future aggregate metrics forwarding to an operator/main server. The current
+  build stores and displays the preference but does not implement an external
+  forwarding transport.
 - `/settings`: private response showing this server's log level, retention policy,
-  log channel, optional rule source channel, bot channels, manager roles, storage
-  summary, and privacy contact.
+  log channel, optional rule source channel, bot channels, manager roles, metrics
+  forwarding preference, storage summary, and privacy contact.
   Any server member can use it to understand what Clause is configured to do.
 - `/summary`: private response with an AI-generated Markdown summary of the
   current curated rules JSON. Any server member can request it when the rules are
@@ -324,6 +336,8 @@ channel imports, rule-source messages, and message review in that server.
   override. The endpoint must be an HTTPS OpenAI-compatible chat-completions URL.
 - `/ai clear`: manager-only removal of the server AI override, falling back to
   environment AI settings.
+- `/ai test`: manager-only health check that sends one small prompt to the active
+  AI provider and returns the provider reply or redacted diagnostic details.
 - `/logs clear confirm:false`: private manager-only preview of retained local log
   usage.
 - `/logs clear confirm:true`: private manager-only deletion of Clause-owned local

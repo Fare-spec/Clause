@@ -404,6 +404,21 @@ impl Ai {
         parse_message_review(&response)
     }
 
+    pub(crate) async fn test_provider(
+        &self,
+        guild_config: Option<&GuildAiConfig>,
+    ) -> Result<String, SummaryError> {
+        let config = self.config_for(guild_config)?;
+        self.chat(
+            &config,
+            "diagnostic",
+            "You are a health check for a Discord moderation bot. Reply briefly.",
+            "Reply with exactly: Clause AI test OK",
+            32,
+        )
+        .await
+    }
+
     async fn chat(
         &self,
         config: &Config,

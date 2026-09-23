@@ -40,6 +40,23 @@ pub(crate) fn limit_metadata(guild_id: u64) -> String {
     )
 }
 
+pub(crate) fn delete_guild(root: &Path, guild_id: u64) -> io::Result<bool> {
+    let directory = root.join(guild_id.to_string());
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) => {
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(io::Error::other(
+                    "Guild storage is not a regular directory.",
+                ));
+            }
+            fs::remove_dir_all(directory)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn register(root: &Path, guild_id: u64) -> io::Result<PathBuf> {
     let directory = root.join(guild_id.to_string());
     fs::create_dir_all(root)?;

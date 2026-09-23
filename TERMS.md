@@ -5,7 +5,7 @@ Last updated: 23 September 2026
 ## Service and operator
 
 Clause currently provides server setup, manager permissions, file storage,
-logging, configurable local retention, curated rules JSON, AI generation of that
+logging, aggregate local metrics, configurable local retention, curated rules JSON, AI generation of that
 rules JSON from manager-uploaded files, manager-selected channel messages, or
 manager messages in an optional rule source channel, AI summaries of the curated
 rules JSON, configurable per-server AI providers, and
@@ -36,7 +36,7 @@ Upload only files you have the right to store and make available to authorized
 server staff. Do not upload unlawful content, credentials, sensitive personal
 information prohibited by Discord's developer rules, or material intended to
 harm the service or its users. Do not evade permissions, quotas, retention
-controls or protections on the size-limit metadata. Curated rules JSON may be
+controls or protections on the size-limit metadata. A small diagnostic prompt may be sent to the configured AI provider when `/ai test` is used. Curated rules JSON may be
 sent to the configured AI provider when `/summary` is used. Files in the upload
 folder may be sent to the configured AI provider when a manager runs `/rules
 generate` to regenerate the curated rules JSON. Recent messages in a
@@ -48,7 +48,7 @@ attachment metadata, and curated rules JSON may be sent to the configured AI
 provider for
 rule review. AI review is advisory and report-only:
 Clause may notify staff and reply with the matched rule explanation, but it does
-not automatically delete messages or punish users. Do not use logs or AI outputs
+not automatically delete messages or punish users. Do not use logs, metrics, or AI outputs
 for surveillance, harassment, profiling, scraping, advertising, data sales or
 model training.
 
@@ -66,7 +66,7 @@ with a legitimate need to see them. Do not redistribute raw logs to all members.
 
 ## Storage and retention limits
 
-Each guild has a shared configurable allowance for uploads, retained logs and metadata. The default is 10 Mo unless the operator changes it before startup.
+Each guild has a shared configurable allowance for uploads, retained logs and metadata. The default is 10 Mo unless the operator changes it before startup. `/metrics show` reports aggregate local counts and sizes to bot managers. The metrics-forwarding preference is stored per guild; this build does not implement external metrics forwarding.
 Uploads are stored separately from retained logs. The protected size-limit JSON
 cannot be changed through file commands. Uploads do not overwrite existing files.
 At capacity, uploads fail and new retained records may be skipped. The service is
@@ -77,7 +77,7 @@ the scope or shortening retention can also remove records. Expiry does not delet
 uploaded files or log messages already posted to Discord. Configured bot managers
 can use `/logs clear confirm:true` to delete Clause-owned local retained logs
 early and free guild storage. Server administrators can use `/disable` to stop
-Clause for the guild until setup is run again. `/files remove` permanently deletes the named
+Clause for the guild until setup is run again. The Discord server owner can use `/leave confirm:true delete_data:true` to delete that guild's local Clause data before the bot leaves. `/files remove` permanently deletes the named
 upload. The [Privacy Policy](PRIVACY.md) describes retention periods, cleanup
 limitations, access and data requests.
 

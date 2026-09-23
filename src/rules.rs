@@ -46,6 +46,10 @@ impl Cache {
         self.books.insert(guild, book.clone());
         Ok(())
     }
+
+    pub(crate) fn forget(&mut self, guild: u64) {
+        self.books.remove(&guild);
+    }
 }
 
 pub(crate) fn validate_id(id: &str) -> io::Result<()> {

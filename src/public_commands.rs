@@ -1,6 +1,7 @@
 use crate::{
     GuildAiConfig, GuildConfig, Handler, delete_ai_config, get_ai_config, get_guild_config,
-    logging::Level, retention, rules, save_ai_config, storage,
+    logging::Level, metrics_forwarding_enabled, retention, rules, save_ai_config,
+    set_metrics_forwarding, storage,
 };
 use serenity::all::*;
 
@@ -11,10 +12,31 @@ pub(crate) fn commands() -> Vec<CreateCommand> {
         CreateCommand::new("storage")
             .description("Show this server's used and available storage")
             .dm_permission(false),
+        metrics_command(),
         CreateCommand::new("disable")
             .description("Disable Clause for this server until /setup is run again")
             .default_member_permissions(Permissions::MANAGE_GUILD)
             .dm_permission(false),
+        CreateCommand::new("leave")
+            .description("Server-owner command to make Clause leave this server")
+            .default_member_permissions(Permissions::MANAGE_GUILD)
+            .dm_permission(false)
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::Boolean,
+                    "confirm",
+                    "Set to true to make Clause leave this server",
+                )
+                .required(true),
+            )
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::Boolean,
+                    "delete_data",
+                    "Set to true to delete this guild's Clause folder and settings first",
+                )
+                .required(true),
+            ),
         CreateCommand::new("settings")
             .description("Show this server's logging, retention, and privacy settings")
             .dm_permission(false),
@@ -158,6 +180,32 @@ fn rules_command() -> CreateCommand {
         )
 }
 
+fn metrics_command() -> CreateCommand {
+    CreateCommand::new("metrics")
+        .description("Show local guild metrics and control metrics forwarding")
+        .dm_permission(false)
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "show",
+            "Show this server's local Clause metrics",
+        ))
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "forwarding",
+                "Allow or disallow future operator metrics forwarding for this server",
+            )
+            .add_sub_option(
+                CreateCommandOption::new(
+                    CommandOptionType::Boolean,
+                    "enabled",
+                    "Whether Clause may forward aggregate metrics for this server",
+                )
+                .required(true),
+            ),
+        )
+}
+
 fn ai_command() -> CreateCommand {
     CreateCommand::new("ai")
         .description("Configure this server's AI provider")
@@ -198,6 +246,11 @@ fn ai_command() -> CreateCommand {
             "clear",
             "Remove this server's AI override and use environment defaults",
         ))
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "test",
+            "Send a small health-check request to this server's AI provider",
+        ))
 }
 
 fn bytes(value: u64) -> String {
@@ -221,6 +274,59 @@ fn storage_embed(usage: &storage::Usage) -> CreateEmbed {
         );
     }
     embed
+}
+
+struct MetricsSnapshot {
+    config: GuildConfig,
+    usage: storage::Usage,
+    upload_files: usize,
+    rule_count: usize,
+    rules_public: bool,
+    has_guild_ai_config: bool,
+    forwarding_enabled: bool,
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "enabled" } else { "disabled" }
+}
+
+fn metrics_embed(snapshot: &MetricsSnapshot) -> CreateEmbed {
+    CreateEmbed::new()
+        .title("Clause metrics for this server")
+        .colour(0x5865F2)
+        .field("Storage used", bytes(snapshot.usage.total), true)
+        .field("Storage available", bytes(snapshot.usage.available()), true)
+        .field("Uploaded files", snapshot.upload_files.to_string(), true)
+        .field("Uploads size", bytes(snapshot.usage.uploads), true)
+        .field("Retained logs size", bytes(snapshot.usage.logs), true)
+        .field("Other metadata", bytes(snapshot.usage.other), true)
+        .field("Curated rules", snapshot.rule_count.to_string(), true)
+        .field(
+            "Rules visibility",
+            if snapshot.rules_public { "public" } else { "private" },
+            true,
+        )
+        .field(
+            "AI provider",
+            if snapshot.has_guild_ai_config {
+                "server override"
+            } else if env_ai_configured() {
+                "environment default"
+            } else {
+                "not configured"
+            },
+            true,
+        )
+        .field("AI review channels", snapshot.config.channel_ids.len().to_string(), true)
+        .field("Manager roles", snapshot.config.admin_role_ids.len().to_string(), true)
+        .field(
+            "Metrics forwarding allowed",
+            yes_no(snapshot.forwarding_enabled),
+            true,
+        )
+        .footer(CreateEmbedFooter::new(
+            "Local metrics are aggregate counts and sizes; they do not include message text, filenames, rule text, usernames, or API keys.",
+        ))
 }
 
 fn id_mentions(ids: &[i64], prefix: &str) -> String {
@@ -264,6 +370,7 @@ fn settings_embed(
     config: &GuildConfig,
     usage: Option<&storage::Usage>,
     has_guild_ai_config: bool,
+    forwarding_enabled: bool,
 ) -> CreateEmbed {
     let log_channel = config
         .log_channel_id
@@ -307,6 +414,11 @@ fn settings_embed(
             ai_review_visibility(has_guild_ai_config),
             false,
         )
+        .field(
+            "Metrics forwarding allowed",
+            yes_no(forwarding_enabled),
+            true,
+        )
         .field("Storage", storage, false)
         .field(
             "Privacy contact",
@@ -318,33 +430,33 @@ fn settings_embed(
         ))
 }
 
-fn summary_error(error: crate::ai::SummaryError) -> (&'static str, Level) {
+fn summary_error(error: &crate::ai::SummaryError) -> (&'static str, Level) {
     match error {
-        crate::ai::SummaryError::MissingConfig => (
+        &crate::ai::SummaryError::MissingConfig => (
             "AI is not configured. Set API_KEY, AI_ENDPOINT_URL, and AI_MODEL before using /summary or /rules generate.",
             Level::Warn,
         ),
-        crate::ai::SummaryError::RulesPrivate => (
+        &crate::ai::SummaryError::RulesPrivate => (
             "Rules are private for this server. Ask a bot manager to make them public or request the summary.",
             Level::Warn,
         ),
-        crate::ai::SummaryError::NoRuleFiles => (
+        &crate::ai::SummaryError::NoRuleFiles => (
             "No rules were found. A bot manager can add rules with /rules add or upload rule files and run /rules generate.",
             Level::Warn,
         ),
-        crate::ai::SummaryError::FilesTooLarge => (
+        &crate::ai::SummaryError::FilesTooLarge => (
             "The rules input is too large for one AI request. Split or shorten the uploaded files or curated rules first.",
             Level::Warn,
         ),
-        crate::ai::SummaryError::Storage => (
+        &crate::ai::SummaryError::Storage => (
             "Could not read curated rules. Ask the bot operator to check guild storage.",
             Level::Error,
         ),
-        crate::ai::SummaryError::ProviderRequest(_) => (
+        &crate::ai::SummaryError::ProviderRequest(_) => (
             "The AI request failed. Check API_KEY, AI_ENDPOINT_URL, AI_MODEL, and provider availability.",
             Level::Error,
         ),
-        crate::ai::SummaryError::BadResponse | crate::ai::SummaryError::ProviderResponse(_) => (
+        &crate::ai::SummaryError::BadResponse | &crate::ai::SummaryError::ProviderResponse(_) => (
             "The AI provider returned an unexpected response.",
             Level::Error,
         ),
@@ -378,12 +490,39 @@ fn disable_guild_settings(db: &rusqlite::Connection, guild: i64) -> rusqlite::Re
             [guild],
         )?;
         delete_ai_config(db, guild)?;
+        set_metrics_forwarding(db, guild, false)?;
         Ok(())
     })();
     if result.is_err() {
         db.execute_batch("ROLLBACK TO disable_guild")?;
     }
     db.execute_batch("RELEASE disable_guild")?;
+    result
+}
+
+fn delete_guild_settings(db: &rusqlite::Connection, guild: i64) -> rusqlite::Result<()> {
+    db.execute_batch("SAVEPOINT delete_guild")?;
+    let result = (|| -> rusqlite::Result<()> {
+        db.execute(
+            "DELETE FROM guild_manager_roles WHERE guild_id = ?1",
+            [guild],
+        )?;
+        db.execute(
+            "DELETE FROM guild_bot_channels WHERE guild_id = ?1",
+            [guild],
+        )?;
+        delete_ai_config(db, guild)?;
+        db.execute(
+            "DELETE FROM guild_metrics_settings WHERE guild_id = ?1",
+            [guild],
+        )?;
+        db.execute("DELETE FROM guild_configs WHERE guild_id = ?1", [guild])?;
+        Ok(())
+    })();
+    if result.is_err() {
+        db.execute_batch("ROLLBACK TO delete_guild")?;
+    }
+    db.execute_batch("RELEASE delete_guild")?;
     result
 }
 
@@ -616,6 +755,126 @@ impl Handler {
         );
     }
 
+    async fn leave_command(&self, ctx: &Context, command: &CommandInteraction) {
+        let Some(guild) = command.guild_id.filter(|_| command.member.is_some()) else {
+            let _ = command
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .ephemeral(true)
+                            .content("Use /leave inside your server."),
+                    ),
+                )
+                .await;
+            return;
+        };
+        if command.defer_ephemeral(&ctx.http).await.is_err() {
+            return;
+        }
+        let options = command.data.options();
+        let confirm = bool_arg(&options, "confirm").unwrap_or(false);
+        let delete_data = bool_arg(&options, "delete_data").unwrap_or(false);
+        if !confirm {
+            let _ = command
+                .edit_response(
+                    &ctx.http,
+                    EditInteractionResponse::new()
+                        .content("Set `confirm:true` to make Clause leave this server."),
+                )
+                .await;
+            return;
+        }
+        let owner = match guild.to_partial_guild(&ctx.http).await {
+            Ok(guild) => guild.owner_id,
+            Err(_) => {
+                let _ = command
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new()
+                            .content("Could not verify the server owner. Try again later."),
+                    )
+                    .await;
+                return;
+            }
+        };
+        if command.user.id != owner {
+            let _ = command
+                .edit_response(
+                    &ctx.http,
+                    EditInteractionResponse::new().content(
+                        "Only the Discord server owner can make Clause leave or delete all guild data.",
+                    ),
+                )
+                .await;
+            return;
+        }
+
+        if delete_data {
+            let database = self.database.clone();
+            let root = self.storage_root.clone();
+            let lock = self.storage_lock.clone();
+            let cache = self.rules.clone();
+            let deleted = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+                let db = database
+                    .lock()
+                    .map_err(|_| "Settings are unavailable.".to_owned())?;
+                delete_guild_settings(&db, guild.get() as i64)
+                    .map_err(|_| "Could not delete this guild's settings.".to_owned())?;
+                let _guard = lock
+                    .lock()
+                    .map_err(|_| "Storage is unavailable.".to_owned())?;
+                if let Ok(mut cache) = cache.lock() {
+                    cache.forget(guild.get());
+                }
+                storage::delete_guild(&root, guild.get())
+                    .map_err(|_| "Could not delete this guild's folder.".to_owned())
+            })
+            .await;
+            match deleted {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    let _ = command
+                        .edit_response(&ctx.http, EditInteractionResponse::new().content(error))
+                        .await;
+                    return;
+                }
+                Err(_) => {
+                    let _ = command
+                        .edit_response(
+                            &ctx.http,
+                            EditInteractionResponse::new()
+                                .content("Could not delete this guild's data."),
+                        )
+                        .await;
+                    return;
+                }
+            }
+        }
+
+        let left = guild.leave(&ctx.http).await;
+        let message = if left.is_ok() {
+            if delete_data {
+                "Clause deleted this guild's local data and left the server."
+            } else {
+                "Clause left the server. Local data was kept for the operator to clean up or restore later."
+            }
+        } else {
+            "Data deletion finished if requested, but Clause could not leave the server. Remove the bot from Discord manually or try again."
+        };
+        let _ = command
+            .edit_response(&ctx.http, EditInteractionResponse::new().content(message))
+            .await;
+        if left.is_err() {
+            self.logger.log(
+                ctx,
+                guild,
+                Level::Error,
+                format!("/leave for user {} failed to leave server", command.user.id),
+            );
+        }
+    }
+
     async fn ai_command(&self, ctx: &Context, command: &CommandInteraction) {
         let Some(guild) = command.guild_id.filter(|_| command.member.is_some()) else {
             let _ = command
@@ -643,7 +902,7 @@ impl Handler {
             let _ = command
                 .edit_response(
                     &ctx.http,
-                    EditInteractionResponse::new().content("Choose show, set, or clear."),
+                    EditInteractionResponse::new().content("Choose show, set, clear, or test."),
                 )
                 .await;
             return;
@@ -652,6 +911,64 @@ impl Handler {
         let database = self.database.clone();
         let member = command.member.clone();
         let action = (*name).to_owned();
+        if action == "test" {
+            let loaded =
+                tokio::task::spawn_blocking(move || -> Result<Option<GuildAiConfig>, String> {
+                    let db = database
+                        .lock()
+                        .map_err(|_| "Settings are unavailable.".to_owned())?;
+                    let config = get_guild_config(&db, guild.get() as i64)
+                        .map_err(|_| "Could not load settings.".to_owned())?
+                        .filter(|config| config.setup_completed)
+                        .ok_or_else(|| "Run /setup before testing AI.".to_owned())?;
+                    if !manager_authorized(&config, member.as_deref()) {
+                        return Err("Only bot managers can test AI.".into());
+                    }
+                    get_ai_config(&db, guild.get() as i64)
+                        .map_err(|_| "Could not load AI settings.".to_owned())
+                })
+                .await;
+            let (message, level) = match loaded {
+                Ok(Ok(ai_config)) => match self.ai.test_provider(ai_config.as_ref()).await {
+                    Ok(reply) => (
+                        format!(
+                            "AI test succeeded. Provider replied: `{}`",
+                            reply.chars().take(500).collect::<String>()
+                        ),
+                        Level::Info,
+                    ),
+                    Err(error) => {
+                        let (public, level) = summary_error(&error);
+                        (
+                            format!("{public}\nDiagnostic: {}", ai_error_detail(&error)),
+                            level,
+                        )
+                    }
+                },
+                Ok(Err(error)) => (error, Level::Warn),
+                Err(_) => ("Could not test AI.".into(), Level::Error),
+            };
+            let sent = command
+                .edit_response(
+                    &ctx.http,
+                    EditInteractionResponse::new().content(message.clone()),
+                )
+                .await
+                .is_ok();
+            self.logger.log(
+                ctx,
+                guild,
+                if sent { level } else { Level::Error },
+                format!(
+                    "/ai test for user {}: {}; response {}",
+                    command.user.id,
+                    message,
+                    if sent { "sent" } else { "failed" }
+                ),
+            );
+            return;
+        }
+
         let endpoint = string_arg(options, "endpoint");
         let model = string_arg(options, "model");
         let api_key = string_arg(options, "api_key");
@@ -706,7 +1023,7 @@ impl Handler {
                         .map_err(|_| "Could not clear AI settings.".to_owned())?;
                     Ok("Server AI provider override cleared. Clause will use environment AI settings.".into())
                 }
-                _ => Err("Choose show, set, or clear.".into()),
+                _ => Err("Choose show, set, clear, or test.".into()),
             }
         })
         .await;
@@ -745,8 +1062,16 @@ impl Handler {
             self.storage_command(ctx, command).await;
             return;
         }
+        if command.data.name == "metrics" {
+            self.metrics_command(ctx, command).await;
+            return;
+        }
         if command.data.name == "disable" {
             self.disable_command(ctx, command).await;
+            return;
+        }
+        if command.data.name == "leave" {
+            self.leave_command(ctx, command).await;
             return;
         }
         if command.data.name == "settings" {
@@ -829,6 +1154,132 @@ impl Handler {
         if result.is_err() {
             eprintln!("Could not deliver policy response.");
         }
+    }
+
+    async fn metrics_command(&self, ctx: &Context, command: &CommandInteraction) {
+        let Some(guild) = command.guild_id.filter(|_| command.member.is_some()) else {
+            let _ = command
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .ephemeral(true)
+                            .content("Use /metrics inside your server."),
+                    ),
+                )
+                .await;
+            return;
+        };
+        if command.defer_ephemeral(&ctx.http).await.is_err() {
+            return;
+        }
+        let options = command.data.options();
+        let Some(ResolvedOption {
+            name,
+            value: ResolvedValue::SubCommand(options),
+            ..
+        }) = options.first()
+        else {
+            let _ = command
+                .edit_response(
+                    &ctx.http,
+                    EditInteractionResponse::new().content("Choose show or forwarding."),
+                )
+                .await;
+            return;
+        };
+
+        let database = self.database.clone();
+        let root = self.storage_root.clone();
+        let lock = self.storage_lock.clone();
+        let cache = self.rules.clone();
+        let member = command.member.clone();
+        let action = (*name).to_owned();
+        let detail_action = action.clone();
+        let enabled = bool_arg(options, "enabled");
+        let result = tokio::task::spawn_blocking(move || -> Result<MetricsSnapshot, String> {
+            let db = database
+                .lock()
+                .map_err(|_| "Settings are unavailable.".to_owned())?;
+            let config = get_guild_config(&db, guild.get() as i64)
+                .map_err(|_| "Could not load settings.".to_owned())?
+                .filter(|config| config.setup_completed)
+                .ok_or_else(|| "Run /setup before checking metrics.".to_owned())?;
+            if !manager_authorized(&config, member.as_deref()) {
+                return Err("Only bot managers can view or change metrics settings.".into());
+            }
+            if action == "forwarding" {
+                let enabled =
+                    enabled.ok_or_else(|| "Choose whether forwarding is enabled.".to_owned())?;
+                set_metrics_forwarding(&db, guild.get() as i64, enabled)
+                    .map_err(|_| "Could not save metrics settings.".to_owned())?;
+            } else if action != "show" {
+                return Err("Choose show or forwarding.".into());
+            }
+            let forwarding_enabled = metrics_forwarding_enabled(&db, guild.get() as i64)
+                .map_err(|_| "Could not load metrics settings.".to_owned())?;
+            let has_guild_ai_config = get_ai_config(&db, guild.get() as i64)
+                .map_err(|_| "Could not load AI settings.".to_owned())?
+                .is_some();
+            let _guard = lock
+                .lock()
+                .map_err(|_| "Storage is unavailable.".to_owned())?;
+            retention::prune(&root, guild.get(), config.retention, retention::now())
+                .map_err(|_| "Could not clean retained logs before reading metrics.".to_owned())?;
+            let usage = storage::stats(&root, guild.get())
+                .map_err(|_| "Could not inspect storage.".to_owned())?;
+            let (files, _) = storage::list(&root, guild.get())
+                .map_err(|_| "Could not inspect uploads.".to_owned())?;
+            let upload_files = files
+                .iter()
+                .filter(|(name, _)| name != storage::LIMIT_FILE)
+                .count();
+            let mut cache = cache
+                .lock()
+                .map_err(|_| "Rules cache is unavailable.".to_owned())?;
+            let rulebook = cache
+                .get(&root, guild.get())
+                .map_err(|_| "Could not inspect curated rules.".to_owned())?;
+            Ok(MetricsSnapshot {
+                config,
+                usage,
+                upload_files,
+                rule_count: rulebook.rules.len(),
+                rules_public: rulebook.public,
+                has_guild_ai_config,
+                forwarding_enabled,
+            })
+        })
+        .await;
+
+        let (response, level, detail) = match result {
+            Ok(Ok(snapshot)) => (
+                EditInteractionResponse::new().embed(metrics_embed(&snapshot)),
+                Level::Info,
+                format!("{detail_action} metrics"),
+            ),
+            Ok(Err(error)) => (
+                EditInteractionResponse::new().content(error.clone()),
+                Level::Warn,
+                error,
+            ),
+            Err(_) => (
+                EditInteractionResponse::new().content("Could not inspect metrics."),
+                Level::Error,
+                "task failed".into(),
+            ),
+        };
+        let sent = command.edit_response(&ctx.http, response).await.is_ok();
+        self.logger.log(
+            ctx,
+            guild,
+            if sent { level } else { Level::Error },
+            format!(
+                "/metrics {name} for user {}: {detail}; response {}",
+                command.user.id,
+                if sent { "sent" } else { "failed" }
+            ),
+        );
     }
 
     async fn storage_command(&self, ctx: &Context, command: &CommandInteraction) {
@@ -921,7 +1372,7 @@ impl Handler {
         let lock = self.storage_lock.clone();
         let root = self.storage_root.clone();
         let result = tokio::task::spawn_blocking(
-            move || -> Result<(GuildConfig, Option<storage::Usage>, bool), &'static str> {
+            move || -> Result<(GuildConfig, Option<storage::Usage>, bool, bool), &'static str> {
                 let db = database.lock().map_err(|_| "Settings are unavailable.")?;
                 let config = get_guild_config(&db, guild.get() as i64)
                     .map_err(|_| "Could not load settings.")?
@@ -930,22 +1381,25 @@ impl Handler {
                 let has_ai_config = get_ai_config(&db, guild.get() as i64)
                     .map_err(|_| "Could not load AI settings.")?
                     .is_some();
+                let forwarding_enabled = metrics_forwarding_enabled(&db, guild.get() as i64)
+                    .map_err(|_| "Could not load metrics settings.")?;
                 let usage = lock.lock().ok().and_then(|_guard| {
                     let _ =
                         retention::prune(&root, guild.get(), config.retention, retention::now());
                     storage::stats(&root, guild.get()).ok()
                 });
-                Ok((config, usage, has_ai_config))
+                Ok((config, usage, has_ai_config, forwarding_enabled))
             },
         )
         .await;
 
         let (response, level) = match result {
-            Ok(Ok((config, usage, has_ai_config))) => (
+            Ok(Ok((config, usage, has_ai_config, forwarding_enabled))) => (
                 EditInteractionResponse::new().embed(settings_embed(
                     &config,
                     usage.as_ref(),
                     has_ai_config,
+                    forwarding_enabled,
                 )),
                 Level::Info,
             ),
@@ -1054,7 +1508,7 @@ impl Handler {
             }
             Err(error) => {
                 let detail = ai_error_detail(&error);
-                let (message, level) = summary_error(error);
+                let (message, level) = summary_error(&error);
                 (
                     EditInteractionResponse::new().content(message),
                     level,
@@ -1345,7 +1799,7 @@ impl Handler {
             Ok(book) => book,
             Err(error) => {
                 let detail = ai_error_detail(&error);
-                let (message, level) = summary_error(error);
+                let (message, level) = summary_error(&error);
                 self.logger.log(
                     ctx,
                     guild,
@@ -1546,7 +2000,7 @@ impl Handler {
             Ok(book) => book,
             Err(error) => {
                 let detail = ai_error_detail(&error);
-                let (message, level) = summary_error(error);
+                let (message, level) = summary_error(&error);
                 self.logger.log(
                     ctx,
                     guild,
@@ -1790,7 +2244,7 @@ mod tests {
     fn public_commands_do_not_require_discord_permissions_or_filename_arguments() {
         for command in commands() {
             let value = serde_json::to_value(command).unwrap();
-            if value["name"] == "disable" {
+            if value["name"] == "disable" || value["name"] == "leave" {
                 assert_eq!(value["default_member_permissions"], "32");
             } else {
                 assert!(value["default_member_permissions"].is_null());
@@ -1818,6 +2272,50 @@ mod tests {
         );
         assert_eq!(value["default_member_permissions"], "32");
         assert_eq!(value["dm_permission"], false);
+    }
+
+    #[test]
+    fn leave_command_requires_explicit_confirmation_and_delete_choice() {
+        let command = commands()
+            .into_iter()
+            .find(|command| serde_json::to_value(command).unwrap()["name"] == "leave")
+            .unwrap();
+        let value = serde_json::to_value(command).unwrap();
+        assert_eq!(value["default_member_permissions"], "32");
+        let options = value["options"].as_array().unwrap();
+        assert!(
+            options
+                .iter()
+                .any(|option| option["name"] == "confirm" && option["required"] == true)
+        );
+        assert!(
+            options
+                .iter()
+                .any(|option| option["name"] == "delete_data" && option["required"] == true)
+        );
+    }
+
+    #[test]
+    fn metrics_command_registers_show_and_forwarding_toggle() {
+        let command = commands()
+            .into_iter()
+            .find(|command| serde_json::to_value(command).unwrap()["name"] == "metrics")
+            .unwrap();
+        let value = serde_json::to_value(command).unwrap();
+        assert_eq!(value["default_member_permissions"], serde_json::Value::Null);
+        let options = value["options"].as_array().unwrap();
+        assert!(options.iter().any(|option| option["name"] == "show"));
+        let forwarding = options
+            .iter()
+            .find(|option| option["name"] == "forwarding")
+            .unwrap();
+        assert!(
+            forwarding["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|option| option["name"] == "enabled" && option["required"] == true)
+        );
     }
 
     #[test]
@@ -1862,6 +2360,13 @@ mod tests {
             .find(|command| serde_json::to_value(command).unwrap()["name"] == "ai")
             .unwrap();
         let ai_value = serde_json::to_value(ai_command).unwrap();
+        assert!(
+            ai_value["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|option| option["name"] == "test")
+        );
         let set = ai_value["options"]
             .as_array()
             .unwrap()
@@ -1908,10 +2413,14 @@ mod tests {
                 endpoint TEXT NOT NULL,
                 api_key TEXT NOT NULL,
                 model TEXT NOT NULL);
+            CREATE TABLE guild_metrics_settings (
+                guild_id INTEGER PRIMARY KEY,
+                forwarding_enabled INTEGER NOT NULL DEFAULT 0);
             INSERT INTO guild_configs VALUES (1, 1, 10, 11, 'debug', 'all:7');
             INSERT INTO guild_manager_roles VALUES (1, 20);
             INSERT INTO guild_bot_channels VALUES (1, 30);
-            INSERT INTO guild_ai_configs VALUES (1, 'https://example.test/v1/chat/completions', 'secret', 'model');",
+            INSERT INTO guild_ai_configs VALUES (1, 'https://example.test/v1/chat/completions', 'secret', 'model');
+            INSERT INTO guild_metrics_settings VALUES (1, 1);",
         )
         .unwrap();
 
@@ -1925,6 +2434,101 @@ mod tests {
         assert!(config.channel_ids.is_empty());
         assert!(config.admin_role_ids.is_empty());
         assert!(get_ai_config(&db, 1).unwrap().is_none());
+        assert!(!metrics_forwarding_enabled(&db, 1).unwrap());
+    }
+
+    #[test]
+    fn delete_guild_settings_removes_all_database_state_for_one_guild() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE guild_configs (
+                guild_id INTEGER PRIMARY KEY,
+                setup_completed INTEGER NOT NULL DEFAULT 0,
+                log_channel_id INTEGER,
+                rule_source_channel_id INTEGER,
+                log_level TEXT NOT NULL DEFAULT 'info',
+                retention TEXT NOT NULL DEFAULT 'none');
+            CREATE TABLE guild_manager_roles (
+                guild_id INTEGER NOT NULL, role_id INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, role_id));
+            CREATE TABLE guild_bot_channels (
+                guild_id INTEGER NOT NULL, channel_id INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, channel_id));
+            CREATE TABLE guild_ai_configs (
+                guild_id INTEGER PRIMARY KEY,
+                endpoint TEXT NOT NULL,
+                api_key TEXT NOT NULL,
+                model TEXT NOT NULL);
+            CREATE TABLE guild_metrics_settings (
+                guild_id INTEGER PRIMARY KEY,
+                forwarding_enabled INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO guild_configs VALUES (1, 1, 10, 11, 'debug', 'all:7');
+            INSERT INTO guild_configs VALUES (2, 1, 20, 21, 'info', 'none');
+            INSERT INTO guild_manager_roles VALUES (1, 20);
+            INSERT INTO guild_manager_roles VALUES (2, 40);
+            INSERT INTO guild_bot_channels VALUES (1, 30);
+            INSERT INTO guild_bot_channels VALUES (2, 50);
+            INSERT INTO guild_ai_configs VALUES (1, 'https://example.test/v1/chat/completions', 'secret', 'model');
+            INSERT INTO guild_metrics_settings VALUES (1, 1);
+            INSERT INTO guild_metrics_settings VALUES (2, 1);",
+        )
+        .unwrap();
+
+        delete_guild_settings(&db, 1).unwrap();
+        assert!(get_guild_config(&db, 1).unwrap().is_none());
+        assert!(get_ai_config(&db, 1).unwrap().is_none());
+        assert!(!metrics_forwarding_enabled(&db, 1).unwrap());
+        assert!(metrics_forwarding_enabled(&db, 2).unwrap());
+        assert_eq!(
+            get_guild_config(&db, 2).unwrap().unwrap().log_channel_id,
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn metrics_report_uses_aggregate_counts_without_content() {
+        let snapshot = MetricsSnapshot {
+            config: GuildConfig {
+                guild_id: 1,
+                setup_completed: true,
+                log_channel_id: Some(10),
+                rule_source_channel_id: None,
+                log_level: Level::Info,
+                retention: retention::Policy::Flagged(7),
+                channel_ids: vec![20, 21],
+                admin_role_ids: vec![30, 31],
+            },
+            usage: storage::Usage {
+                uploads: 10,
+                logs: 20,
+                other: 30,
+                total: 60,
+            },
+            upload_files: 2,
+            rule_count: 4,
+            rules_public: true,
+            has_guild_ai_config: false,
+            forwarding_enabled: false,
+        };
+        let value = serde_json::to_value(metrics_embed(&snapshot)).unwrap();
+        let fields = value["fields"].as_array().unwrap();
+        assert!(
+            fields
+                .iter()
+                .any(|field| { field["name"] == "Uploaded files" && field["value"] == "2" })
+        );
+        assert!(
+            fields
+                .iter()
+                .any(|field| { field["name"] == "Curated rules" && field["value"] == "4" })
+        );
+        assert!(fields.iter().any(|field| {
+            field["name"] == "Metrics forwarding allowed"
+                && field["value"].as_str().unwrap().contains("disabled")
+        }));
+        let serialized = value.to_string();
+        assert!(!serialized.contains("secret"));
+        assert!(!serialized.contains("rules.pdf"));
     }
 
     #[test]
@@ -1945,7 +2549,8 @@ mod tests {
             other: 2,
             total: 14,
         };
-        let value = serde_json::to_value(settings_embed(&config, Some(&usage), true)).unwrap();
+        let value =
+            serde_json::to_value(settings_embed(&config, Some(&usage), true, true)).unwrap();
         let fields = value["fields"].as_array().unwrap();
         assert!(fields.iter().any(|field| field["name"] == "Local retention"
             && field["value"].as_str().unwrap().contains("All messages")));
@@ -1968,6 +2573,10 @@ mod tests {
         }));
         assert!(fields.iter().any(|field| {
             field["name"] == "AI rule review" && field["value"].as_str().unwrap().contains("AI")
+        }));
+        assert!(fields.iter().any(|field| {
+            field["name"] == "Metrics forwarding allowed"
+                && field["value"].as_str().unwrap().contains("enabled")
         }));
     }
 }

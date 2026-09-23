@@ -32,9 +32,9 @@ where the bot has access. Clause does not fetch historical messages in bulk.
 A manager's `/files upload` downloads the selected attachment and stores its bytes
 and filename in that server's upload folder. Ordinary message attachments are not
 automatically downloaded for retention. The bot does not execute uploaded files.
-`/storage` shows aggregate usage, not filenames or message content.
+`/storage` shows aggregate usage, not filenames or message content. `/metrics show` is manager-only and shows aggregate local counts and sizes, such as upload count, retained log size, rule count, AI provider source, and whether metrics forwarding is allowed. It does not show message text, filenames, rule text, usernames, or API keys.
 
-When AI is configured, `/summary` sends the curated rules JSON from this server's
+When AI is configured, `/ai test` sends one small diagnostic prompt to the active provider. `/summary` sends the curated rules JSON from this server's
 `rules/rules.json` file to the configured AI endpoint to generate a rule summary.
 `/rules generate` is manager-only and sends the current files in that server's
 `uploads/` folder to the configured AI endpoint so it can extract rules and
@@ -60,7 +60,7 @@ rule-source channels, or bot-channel messages.
 ## Storage and retention
 
 Server configuration is stored in SQLite, including role/channel IDs, the optional
-rule source channel ID, log level, retention policy, and any server-specific AI
+rule source channel ID, log level, retention policy, the metrics forwarding preference, and any server-specific AI
 provider override. Each server has a separate directory containing protected
 quota metadata, an `uploads/` folder, and a `logs/` folder. Uploads, local retained
 logs, and metadata share a configurable per-guild limit, defaulting to 10 Mo (10,000,000 bytes). SQLite configuration and
@@ -79,7 +79,7 @@ startup, approximately every minute while the bot is running, before file/storag
 operations, and when setup is saved. Offline periods or storage errors can delay
 physical deletion until cleanup succeeds. Shorter policies apply to existing
 records. Configured bot managers can also run `/logs clear confirm:true` to delete
-Clause-owned local retained logs early and free guild storage. Server administrators can run `/disable` to mark setup incomplete and clear retained local logs for that guild. Uploads have no
+Clause-owned local retained logs early and free guild storage. Server administrators can run `/disable` to mark setup incomplete and clear retained local logs for that guild. The Discord server owner can run `/leave confirm:true delete_data:true` to delete that guild's local Clause settings and guild storage folder before the bot leaves. Uploads have no
 automatic expiry; authorized managers can remove them, and the operator handles
 applicable personal-data requests. Configuration and folders are not automatically
 erased when the bot leaves a server; the operator must remove data when it is no
@@ -111,7 +111,7 @@ DMs and global multi-guild events are excluded from guild logs. Credentials in
 known event fields and forwarded/referenced message bodies are redacted. These
 filters cannot identify every secret someone includes in ordinary message text;
 do not send passwords, tokens, or sensitive personal information to the bot.
-The current application has no advertising, data-sale, or model-training feature.
+The current application has no advertising, data-sale, or model-training feature. The current build stores a per-server metrics-forwarding preference but does not send metrics to a main server or external telemetry endpoint.
 
 ## Your data requests
 

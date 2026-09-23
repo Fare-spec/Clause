@@ -82,6 +82,9 @@ fn early_init(database: &str) -> rusqlite::Result<Connection> {
             endpoint TEXT NOT NULL,
             api_key TEXT NOT NULL,
             model TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS guild_metrics_settings (
+            guild_id INTEGER PRIMARY KEY,
+            forwarding_enabled INTEGER NOT NULL DEFAULT 0);
         INSERT OR IGNORE INTO guild_manager_roles SELECT guild_id, admin_role_id
             FROM guild_configs WHERE admin_role_id IS NOT NULL;
         INSERT OR IGNORE INTO guild_bot_channels SELECT guild_id, channel_to_manage
@@ -211,6 +214,33 @@ pub(crate) fn delete_ai_config(conn: &Connection, guild_id: i64) -> rusqlite::Re
     conn.execute(
         "DELETE FROM guild_ai_configs WHERE guild_id = ?1",
         [guild_id],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn metrics_forwarding_enabled(
+    conn: &Connection,
+    guild_id: i64,
+) -> rusqlite::Result<bool> {
+    let mut statement =
+        conn.prepare("SELECT forwarding_enabled FROM guild_metrics_settings WHERE guild_id = ?1")?;
+    let mut rows = statement.query([guild_id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(false);
+    };
+    Ok(row.get::<_, bool>(0)?)
+}
+
+pub(crate) fn set_metrics_forwarding(
+    conn: &Connection,
+    guild_id: i64,
+    enabled: bool,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO guild_metrics_settings (guild_id, forwarding_enabled)
+        VALUES (?1, ?2) ON CONFLICT(guild_id) DO UPDATE SET
+        forwarding_enabled = excluded.forwarding_enabled",
+        params![guild_id, enabled],
     )?;
     Ok(())
 }
