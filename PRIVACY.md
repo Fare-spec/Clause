@@ -1,6 +1,6 @@
 # Clause Privacy Policy
 
-Last updated: 22 September 2026
+Last updated: 23 September 2026
 
 ## Operator and contact
 
@@ -41,7 +41,11 @@ When AI is configured, `/summary` sends the curated rules JSON from this server'
 replace `rules/rules.json`. `/rules from-channel` is manager-only and sends up to
 100 recent non-bot text messages from a selected channel to the configured AI
 endpoint so it can extract rule-relevant messages and replace `rules/rules.json`.
-Clause also sends ordinary messages in configured bot channels, plus attachment
+If a rule source channel is configured, each message posted there by a bot
+manager is sent to the configured AI endpoint so Clause can decide whether it is
+rule-relevant and add or update extracted rules. Messages from non-managers in
+that channel are ignored by Clause. Clause also sends ordinary messages in
+configured bot channels, plus attachment
 metadata and the curated rules JSON, to the configured AI endpoint for
 report-only rule review. Compliant messages produce no public
 response. Clear violations and gray-area results are posted to the configured log
@@ -55,8 +59,9 @@ rule-source channels, or bot-channel messages.
 
 ## Storage and retention
 
-Server configuration is stored in SQLite, including role/channel IDs, log level,
-retention policy, and any server-specific AI provider override. Each server has a separate directory containing protected
+Server configuration is stored in SQLite, including role/channel IDs, the optional
+rule source channel ID, log level, retention policy, and any server-specific AI
+provider override. Each server has a separate directory containing protected
 quota metadata, an `uploads/` folder, and a `logs/` folder. Uploads, local retained
 logs, and metadata share a configurable per-guild limit, defaulting to 10 Mo (10,000,000 bytes). SQLite configuration and
 Discord-hosted messages are outside this file quota.

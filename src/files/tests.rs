@@ -5,6 +5,7 @@ fn config() -> GuildConfig {
         guild_id: 1,
         setup_completed: true,
         log_channel_id: Some(4),
+        rule_source_channel_id: None,
         log_level: crate::logging::Level::Info,
         retention: crate::retention::Policy::None,
         channel_ids: vec![3, 5],

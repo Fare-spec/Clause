@@ -1,13 +1,14 @@
 # Clause Terms of Service
 
-Last updated: 22 September 2026
+Last updated: 23 September 2026
 
 ## Service and operator
 
 Clause currently provides server setup, manager permissions, file storage,
 logging, configurable local retention, curated rules JSON, AI generation of that
-rules JSON from manager-uploaded files or manager-selected channel messages, AI
-summaries of the curated rules JSON, configurable per-server AI providers, and
+rules JSON from manager-uploaded files, manager-selected channel messages, or
+manager messages in an optional rule source channel, AI summaries of the curated
+rules JSON, configurable per-server AI providers, and
 report-only AI review of messages in configured bot channels. The operator
 identified by `/privacy` runs the particular installation and is responsible for
 support.
@@ -40,8 +41,11 @@ sent to the configured AI provider when `/summary` is used. Files in the upload
 folder may be sent to the configured AI provider when a manager runs `/rules
 generate` to regenerate the curated rules JSON. Recent messages in a
 manager-selected channel may be sent to the configured AI provider when a manager
-runs `/rules from-channel`. Messages in configured bot channels, attachment
-metadata, and curated rules JSON may be sent to the configured AI provider for
+runs `/rules from-channel`. Messages posted by bot managers in a configured rule
+source channel may be sent to the configured AI provider to decide whether they
+contain rules and to merge extracted rules. Messages in configured bot channels,
+attachment metadata, and curated rules JSON may be sent to the configured AI
+provider for
 rule review. AI review is advisory and report-only:
 Clause may notify staff and reply with the matched rule explanation, but it does
 not automatically delete messages or punish users. Do not use logs or AI outputs
@@ -55,8 +59,9 @@ provide access to the privacy policy and operator contact, and ensure they have
 the necessary authority and legal basis for their configuration. Selecting a
 setting is not consent on behalf of every person whose data may appear in it.
 Use only the data and retention needed for the stated server function. Debug and
-All retention can capture message content outside bot-command channels that the
-bot can access; limit the bot's channel access and keep logs restricted to staff
+All retention and a configured rule source channel can capture message content
+outside bot-command channels that the bot can access; limit the bot's channel
+access and keep logs restricted to staff
 with a legitimate need to see them. Do not redistribute raw logs to all members.
 
 ## Storage and retention limits

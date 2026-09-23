@@ -114,6 +114,10 @@ The private Discord setup uses two pages with dropdowns, Back/Next, and Save/Can
   channels are reviewed against the rules.
 - **Log channel:** the destination for this guild’s logs. The bot needs View Channel,
   Send Messages, and Embed Links here.
+- **Rule source channel:** optional text channel where bot managers can post rule
+  notes. Clause sends each manager message in that channel to the configured AI
+  endpoint, ignores irrelevant messages, and adds or updates extracted rules in
+  `rules/rules.json`. Non-manager messages in that channel are ignored.
 - **Logging level:** off, error, warn, info (default), or debug.
 - **Disk retention (page 2):** none (default), flagged/managed messages for
   7/30/90 days, or all messages and bot actions for 1/7/30 days.
@@ -126,7 +130,7 @@ survive restarts. Cancel leaves previously saved settings intact.
 
 Run `/disable` as an administrator or member with Manage Server to disable Clause for the server. It marks setup incomplete, clears selected manager roles/channels, removes the server AI override, clears retained local logs, and keeps uploads/rules on disk for later cleanup or reuse. Run `/setup` again to enable the bot.
 
-Run `/setup` again to edit existing settings.Run `/setup` again to edit existing settings. Only one administrator can configure
+Run `/setup` again to edit existing settings. Only one administrator can configure
 a server at a time; reopening your own setup replaces your previous panel. Panels
 expire after 15 minutes or a bot restart. Only administrators and members with
 Manage Server can change setup, including the manager roles.
@@ -278,7 +282,7 @@ The AI request contains the current message content, attachment metadata
 (filename, type, size), and the curated rules JSON. It does not download ordinary
 message attachments for review. If a manager configured a server-specific AI
 provider with `/ai set`, that provider is used for summaries, rule generation,
-channel imports, and message review in that server.
+channel imports, rule-source messages, and message review in that server.
 
 ## Storage status and privacy information
 
@@ -287,7 +291,8 @@ channel imports, and message review in that server.
   logs, and metadata/other breakdown after retention cleanup. Any server member
   can request the aggregate; no file names or log contents are exposed.
 - `/settings`: private response showing this server's log level, retention policy,
-  log channel, bot channels, manager roles, storage summary, and privacy contact.
+  log channel, optional rule source channel, bot channels, manager roles, storage
+  summary, and privacy contact.
   Any server member can use it to understand what Clause is configured to do.
 - `/summary`: private response with an AI-generated Markdown summary of the
   current curated rules JSON. Any server member can request it when the rules are
@@ -304,6 +309,9 @@ channel imports, and message review in that server.
   rules JSON from up to 1,000 recent non-bot text messages in the selected channel.
   The AI is instructed to ignore messages that are not rules or rule
   clarifications.
+- Rule source channel messages: when configured in `/setup`, each message posted
+  there by a bot manager is sent to AI as a rule-import candidate. Relevant
+  results are merged into the curated rules JSON; irrelevant messages are ignored.
 - `/rules add id severity text`: manager-only add or replace of a rule.
 - `/rules update id [severity] [text]`: manager-only update of an existing rule.
 - `/rules remove id`: manager-only removal of a rule.

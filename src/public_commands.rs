@@ -271,6 +271,12 @@ fn settings_embed(
         .filter(|id| *id != 0)
         .map(|id| format!("<#{id}>"))
         .unwrap_or_else(|| "None configured".into());
+    let rule_source = config
+        .rule_source_channel_id
+        .and_then(|id| u64::try_from(id).ok())
+        .filter(|id| *id != 0)
+        .map(|id| format!("<#{id}>"))
+        .unwrap_or_else(|| "None configured".into());
     let storage = usage.map_or_else(
         || "Storage unavailable".into(),
         |usage| {
@@ -295,6 +301,7 @@ fn settings_embed(
             false,
         )
         .field("Message visibility", message_visibility(config), false)
+        .field("Rule source channel", rule_source, false)
         .field(
             "AI rule review",
             ai_review_visibility(has_guild_ai_config),
@@ -356,10 +363,10 @@ fn disable_guild_settings(db: &rusqlite::Connection, guild: i64) -> rusqlite::Re
     db.execute_batch("SAVEPOINT disable_guild")?;
     let result = (|| -> rusqlite::Result<()> {
         db.execute(
-            "INSERT INTO guild_configs (guild_id, setup_completed, log_channel_id, log_level, retention)
-            VALUES (?1, 0, NULL, 'off', 'none')
+            "INSERT INTO guild_configs (guild_id, setup_completed, log_channel_id, rule_source_channel_id, log_level, retention)
+            VALUES (?1, 0, NULL, NULL, 'off', 'none')
             ON CONFLICT(guild_id) DO UPDATE SET
-            setup_completed = 0, log_channel_id = NULL, log_level = 'off', retention = 'none'",
+            setup_completed = 0, log_channel_id = NULL, rule_source_channel_id = NULL, log_level = 'off', retention = 'none'",
             [guild],
         )?;
         db.execute(
@@ -1887,6 +1894,7 @@ mod tests {
                 guild_id INTEGER PRIMARY KEY,
                 setup_completed INTEGER NOT NULL DEFAULT 0,
                 log_channel_id INTEGER,
+                rule_source_channel_id INTEGER,
                 log_level TEXT NOT NULL DEFAULT 'info',
                 retention TEXT NOT NULL DEFAULT 'none');
             CREATE TABLE guild_manager_roles (
@@ -1900,7 +1908,7 @@ mod tests {
                 endpoint TEXT NOT NULL,
                 api_key TEXT NOT NULL,
                 model TEXT NOT NULL);
-            INSERT INTO guild_configs VALUES (1, 1, 10, 'debug', 'all:7');
+            INSERT INTO guild_configs VALUES (1, 1, 10, 11, 'debug', 'all:7');
             INSERT INTO guild_manager_roles VALUES (1, 20);
             INSERT INTO guild_bot_channels VALUES (1, 30);
             INSERT INTO guild_ai_configs VALUES (1, 'https://example.test/v1/chat/completions', 'secret', 'model');",
@@ -1911,6 +1919,7 @@ mod tests {
         let config = get_guild_config(&db, 1).unwrap().unwrap();
         assert!(!config.setup_completed);
         assert_eq!(config.log_channel_id, None);
+        assert_eq!(config.rule_source_channel_id, None);
         assert_eq!(config.log_level, Level::Off);
         assert_eq!(config.retention, retention::Policy::None);
         assert!(config.channel_ids.is_empty());
@@ -1924,6 +1933,7 @@ mod tests {
             guild_id: 1,
             setup_completed: true,
             log_channel_id: Some(10),
+            rule_source_channel_id: Some(11),
             log_level: Level::Debug,
             retention: retention::Policy::All(7),
             channel_ids: vec![20, 21],
@@ -1951,6 +1961,10 @@ mod tests {
                     .as_str()
                     .unwrap()
                     .contains("retained locally")
+        }));
+        assert!(fields.iter().any(|field| {
+            field["name"] == "Rule source channel"
+                && field["value"].as_str().unwrap().contains("<#11>")
         }));
         assert!(fields.iter().any(|field| {
             field["name"] == "AI rule review" && field["value"].as_str().unwrap().contains("AI")

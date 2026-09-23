@@ -35,6 +35,7 @@ struct GuildConfig {
     pub guild_id: i64,
     pub setup_completed: bool,
     pub log_channel_id: Option<i64>,
+    pub rule_source_channel_id: Option<i64>,
     pub log_level: logging::Level,
     pub retention: retention::Policy,
     pub channel_ids: Vec<i64>,
@@ -112,6 +113,18 @@ fn early_init(database: &str) -> rusqlite::Result<Connection> {
             [],
         )?;
     }
+    let has_rule_source = conn
+        .prepare("PRAGMA table_info(guild_configs)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "rule_source_channel_id");
+    if !has_rule_source {
+        conn.execute(
+            "ALTER TABLE guild_configs ADD COLUMN rule_source_channel_id INTEGER",
+            [],
+        )?;
+    }
     Ok(conn)
 }
 
@@ -122,7 +135,7 @@ fn get_guild_config(conn: &Connection, guild_id: i64) -> rusqlite::Result<Option
             SELECT
                 guild_id,
                 setup_completed,
-                log_channel_id, log_level, retention
+                log_channel_id, rule_source_channel_id, log_level, retention
             FROM {TABLE_NAME}
             WHERE guild_id = ?1
             "
@@ -138,8 +151,9 @@ fn get_guild_config(conn: &Connection, guild_id: i64) -> rusqlite::Result<Option
         guild_id: row.get(0)?,
         setup_completed: row.get(1)?,
         log_channel_id: row.get(2)?,
-        log_level: logging::Level::parse(&row.get::<_, String>(3)?).unwrap_or(logging::Level::Off),
-        retention: retention::Policy::parse(&row.get::<_, String>(4)?)
+        rule_source_channel_id: row.get(3)?,
+        log_level: logging::Level::parse(&row.get::<_, String>(4)?).unwrap_or(logging::Level::Off),
+        retention: retention::Policy::parse(&row.get::<_, String>(5)?)
             .unwrap_or(retention::Policy::None),
         channel_ids: read_ids(conn, "guild_bot_channels", "channel_id", guild_id)?,
         admin_role_ids: read_ids(conn, "guild_manager_roles", "role_id", guild_id)?,
@@ -467,12 +481,6 @@ impl EventHandler for Handler {
                 }
             }
         };
-        let in_bot_channel = config
-            .channel_ids
-            .contains(&(message.channel_id.get() as i64));
-        if !in_bot_channel {
-            return;
-        }
         let permissions = message.author_permissions(&ctx).unwrap_or_default();
         let manager_role = message.member.as_ref().is_some_and(|member| {
             member
@@ -481,6 +489,20 @@ impl EventHandler for Handler {
                 .any(|id| config.admin_role_ids.contains(&(id.get() as i64)))
         });
         let manager = permissions.administrator() || permissions.manage_guild() || manager_role;
+        let in_rule_source = config.rule_source_channel_id == Some(message.channel_id.get() as i64);
+        if in_rule_source {
+            if manager {
+                self.ingest_rule_source_message(&ctx, &message, guild).await;
+            }
+            return;
+        }
+
+        let in_bot_channel = config
+            .channel_ids
+            .contains(&(message.channel_id.get() as i64));
+        if !in_bot_channel {
+            return;
+        }
 
         match message.content.as_str() {
             "!ping" if manager => {
@@ -508,6 +530,7 @@ impl EventHandler for Handler {
 Guild ID: {}
 Setup completed: {}
 Log channel: {:?}
+Rule source channel: {:?}
 Bot channels: {:?}
 Manager roles: {:?}
 Logging level: {}
@@ -515,6 +538,7 @@ Retention: {}",
                     config.guild_id,
                     config.setup_completed,
                     config.log_channel_id,
+                    config.rule_source_channel_id,
                     config.channel_ids,
                     config.admin_role_ids,
                     config.log_level.as_str(),
@@ -646,6 +670,144 @@ Retention: {}",
                     message.id, message.channel_id
                 ),
             );
+        }
+    }
+}
+
+impl Handler {
+    async fn ingest_rule_source_message(&self, ctx: &Context, message: &Message, guild: GuildId) {
+        let content = message.content.trim();
+        if content.is_empty() {
+            return;
+        }
+        let ai_config = self.guild_ai_config(guild);
+        let public = {
+            let root = self.storage_root.clone();
+            let lock = self.storage_lock.clone();
+            let cache = self.rules.clone();
+            tokio::task::spawn_blocking(move || {
+                let _guard = lock.lock().map_err(|_| crate::ai::SummaryError::Storage)?;
+                let mut cache = cache.lock().map_err(|_| crate::ai::SummaryError::Storage)?;
+                cache
+                    .get(&root, guild.get())
+                    .map(|book| book.public)
+                    .map_err(|_| crate::ai::SummaryError::Storage)
+            })
+            .await
+            .map_err(|_| crate::ai::SummaryError::Storage)
+            .and_then(|result| result)
+            .unwrap_or(false)
+        };
+        let generated = self
+            .ai
+            .generate_rulebook_from_messages(
+                &[(message.author.id.to_string(), content.to_owned())],
+                public,
+                ai_config.as_ref(),
+            )
+            .await;
+        let generated = match generated {
+            Ok(book) => book,
+            Err(crate::ai::SummaryError::NoRuleFiles) => return,
+            Err(error) => {
+                let detail = match &error {
+                    crate::ai::SummaryError::ProviderRequest(diagnostic)
+                    | crate::ai::SummaryError::ProviderResponse(diagnostic) => {
+                        diagnostic.to_string()
+                    }
+                    _ => format!("{error:?}"),
+                };
+                self.logger.log(
+                    ctx,
+                    guild,
+                    logging::Level::Error,
+                    format!(
+                        "Rule source import failed for message {} by user {} in channel {}: {detail}",
+                        message.id, message.author.id, message.channel_id
+                    ),
+                );
+                return;
+            }
+        };
+        let generated_count = generated.rules.len();
+        let saved = {
+            let root = self.storage_root.clone();
+            let lock = self.storage_lock.clone();
+            let cache = self.rules.clone();
+            tokio::task::spawn_blocking(move || -> Result<usize, String> {
+                let _guard = lock
+                    .lock()
+                    .map_err(|_| "Storage is unavailable.".to_owned())?;
+                let mut cache = cache
+                    .lock()
+                    .map_err(|_| "Rules cache is unavailable.".to_owned())?;
+                let mut book = cache
+                    .get(&root, guild.get())
+                    .map_err(|_| "Could not read existing rules.".to_owned())?;
+                book.public = public;
+                for rule in generated.rules {
+                    rules::upsert(&mut book, &rule.id, &rule.severity, Some(&rule.text))
+                        .map_err(|_| "Could not merge generated rule.".to_owned())?;
+                }
+                cache
+                    .save(&root, guild.get(), &book)
+                    .map_err(|_| "Could not save generated rules.".to_owned())?;
+                Ok(generated_count)
+            })
+            .await
+        };
+        match saved {
+            Ok(Ok(count)) => {
+                self.logger.log(
+                    ctx,
+                    guild,
+                    logging::Level::Info,
+                    format!(
+                        "Rule source message {} by user {} updated {} curated rule(s).",
+                        message.id, message.author.id, count
+                    ),
+                );
+                let _ = message
+                    .channel_id
+                    .send_message(
+                        &ctx.http,
+                        CreateMessage::new()
+                            .content(format!(
+                                "Updated curated rules from this message: {count} rule(s)."
+                            ))
+                            .reference_message(message)
+                            .allowed_mentions(
+                                CreateAllowedMentions::new()
+                                    .all_users(false)
+                                    .all_roles(false)
+                                    .everyone(false)
+                                    .replied_user(false),
+                            ),
+                    )
+                    .await;
+            }
+            Ok(Err(error)) => {
+                self.logger.log(
+                    ctx,
+                    guild,
+                    logging::Level::Error,
+                    format!(
+                        "Rule source message {} by user {} could not be saved: {error}",
+                        message.id, message.author.id
+                    ),
+                );
+            }
+            Err(_) => {
+                self.logger.log(
+                    ctx,
+                    guild,
+                    logging::Level::Error,
+                    format!(
+                        "Rule source message {} by user {} could not be processed.",
+                        message.id, message.author.id
+                    ),
+                );
+            }
         }
     }
 }
