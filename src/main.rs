@@ -558,7 +558,7 @@ impl EventHandler for Handler {
             return;
         };
 
-        let (config, auto_delete) = {
+        let config = {
             let Ok(database) = self.database.lock() else {
                 return;
             };
@@ -570,8 +570,7 @@ impl EventHandler for Handler {
                     return;
                 }
             };
-            let auto_delete = auto_delete_enabled(&database, guild.get() as i64).unwrap_or(false);
-            (config, auto_delete)
+            config
         };
         let permissions = message.author_permissions(&ctx).unwrap_or_default();
         let manager_role = message.member.as_ref().is_some_and(|member| {
@@ -685,9 +684,11 @@ Retention: {}",
         };
         let ai_config = self.guild_ai_config(guild);
         self.record_metric(guild, metrics::Counter::AiReviews, 1);
+        let mut evidence_sources = vec![message.content.as_str()];
+        evidence_sources.extend(message.attachments.iter().map(|attachment| attachment.filename.as_str()));
         let review = self
             .ai
-            .review_message(&rulebook, &message_text, ai_config.as_ref())
+            .review_message(&rulebook, &message_text, &evidence_sources, ai_config.as_ref())
             .await;
         let review = match review {
             Ok(review) if review.value.needs_action() => review,
@@ -725,6 +726,20 @@ Retention: {}",
                 );
                 return;
             }
+        };
+
+        // Settings may have changed while the provider was processing the message.
+        let auto_delete = {
+            let Ok(database) = self.database.lock() else {
+                return;
+            };
+            if !matches!(
+                get_guild_config(&database, guild.get() as i64),
+                Ok(Some(config)) if config.setup_completed
+            ) {
+                return;
+            }
+            auto_delete_enabled(&database, guild.get() as i64).unwrap_or(false)
         };
 
         let mention_roles = config
@@ -774,15 +789,15 @@ Retention: {}",
                     );
                     return;
                 }
-                Err(_) => {
+                Err(error) => {
                     self.record_metric(guild, metrics::Counter::AiDeleteFailures, 1);
                     self.logger.log(
                         &ctx,
                         guild,
                         logging::Level::Error,
                         format!(
-                            "Could not delete AI-flagged message {} in channel {}.",
-                            message.id, message.channel_id
+                            "Could not delete AI-flagged message {} in channel {}: {}",
+                            message.id, message.channel_id, error
                         ),
                     );
                 }
